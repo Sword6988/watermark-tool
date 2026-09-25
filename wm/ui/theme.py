@@ -531,9 +531,14 @@ class _AngleDial(tk.Canvas):
                 对称」的歧义 —— θ 与 θ+180° 画出来是同一条线，靠箭头区分
     ==========  ==========================================================
 
-    交互：拖动手柄转角度；按住 **Shift** 吸附到 15° 的整数倍（对齐平铺角度
-    比一像素 ≈1.8° 的粒度好用）；靠近圆心按下忽略（那里的方向极不稳定，
-    强行取值会跳数）。精细数值仍由数字框 + 步进三角负责。
+    交互：拖动手柄转角度。**默认吸附 5°** —— 半径 40px 时 1px ≈ 1.43°，自由拖
+    几乎停不住想要的整数（容差只有 0.35px），而角度差 1° 视觉上根本看不出来，
+    所以默认给一个能稳定命中 0 / 30 / 45 的粗粒度；按住 **Shift** 吸附 15°
+    （对齐平铺角度），按住 **Alt** 关闭吸附回到 1° 自由。要精确到某一度就用
+    数字框 + 步进三角（那里始终是 1°）。
+
+    靠近圆心（``DEAD_RATIO``）**按下与拖动全程都不取值**：那里的方向对位移的
+    敏感度趋于无穷（0.2 半径处 1px ≈ 7.2°），强行取值就是数字疯跳。
 
     公共 API 与 ``FlatScale`` 保持同一最小集（``get`` / ``set`` / ``state``），
     因此 ``SliderField`` 可以无差别替换 —— 只换绘制与交互，不动上层调用。
@@ -545,12 +550,20 @@ class _AngleDial(tk.Canvas):
     ARROW_HALF = 3.5    # 箭头半宽
     ARROW_GAP = 2       # 箭头与手柄之间的间隙
     LINE_OVER = 6       # 方向线负方向探出圈外的长度（让它读起来像"轴"而非"射线"）
-    SNAP_DEG = 15.0     # 按住 Shift 时的吸附粒度
-    DEAD_RATIO = 0.45   # 圆心死区（占半径比例）：小于它按下不取值
+    #: 吸附粒度三档：默认 5°（见类注释里的 1.43°/px 推导）、Shift 15°、Alt 不吸附。
+    #: 角度是"看个方向"的量，5° 一格既好命中常用角，又不至于让用户觉得失控。
+    SNAP_DEFAULT = 5.0
+    SNAP_SHIFT = 15.0
+    # Tk 的修饰键掩码：Shift=1，Alt 在 Windows 上是 Mod1=8（Tk 文档约定）
+    SHIFT_MASK = 0x0001
+    ALT_MASK = 0x0008
+    DEAD_RATIO = 0.45   # 圆心死区（占半径比例）：全程（按下 + 拖动）都不取值
 
     def __init__(self, parent, from_: float = 0.0, to: float = 360.0,
                  command: Optional[Callable[[float], None]] = None,
-                 bg: str = PANEL, **_ignored) -> None:
+                 bg: str = PANEL,
+                 quantize: Optional[Callable[[float], float]] = None,
+                 **_ignored) -> None:
         # 圈外余量必须容得下「手柄半径 + 间隙 + 箭头长」：箭头画在手柄**外侧**，
         # 余量不足就会被后画的手柄盖住（原型第一版正是如此，箭头等于没有）。
         self._room = px(self.KNOB) + px(self.ARROW_GAP) + px(self.ARROW_LEN) + px(2)
@@ -559,6 +572,10 @@ class _AngleDial(tk.Canvas):
                          highlightthickness=0, bd=0, cursor="hand2", takefocus=0)
         self._lo, self._hi = float(from_), float(to)
         self._cmd = command
+        # 由 SliderField 传入的量化器（按步长取整 + 循环归一）。**拖动时也走它**，
+        # 否则圆盘内部留着未量化的小数、旁边数字框显示取整后的值，两者不一致
+        # （实测偏差可达 0.5°，外部 set() 时手柄还会悄悄回跳一下）。
+        self._quantize = quantize
         self._bg_color = bg
         self._value = self._lo
         self._hover = False
@@ -596,11 +613,20 @@ class _AngleDial(tk.Canvas):
         return math.hypot(x - c, y - c)
 
     def _value_of(self, x: float, y: float) -> float:
-        """屏幕点 -> 角度值（按圆环方向反算，再线性映射到 ``[lo, hi]``）。"""
+        """屏幕点 -> 角度值。
+
+        **不能**把屏幕角线性映射到 ``[lo, hi]``（``lo + ang/360*span``）：那只在
+        ``lo == 0`` 时成立。圆盘的语义是「**值 v 显示在角度 v 的位置上**」——
+        值域改成 -180..180 后，线性映射会把 0° 画到 9 点方向去（因为 0 是区间的
+        中点）。正确做法：以 ``lo`` 为原点取模，把屏幕角搬进值域，再夹到上界。
+        """
         c = self._center()
         ang = math.degrees(math.atan2(-(y - c), x - c)) % 360.0
-        span = (self._hi - self._lo) or 360.0
-        return self._lo + ang / 360.0 * span
+        value = self._lo + math.fmod(ang - self._lo, 360.0)
+        # ±180 是同一条直径：统一取 +180（与 spec.wrap_deg 的半开半闭约定一致）
+        if abs(value - self._lo) < 1e-9 and self._lo < 0.0:
+            value = self._hi
+        return min(max(value, self._lo), self._hi)
 
     # -- 交互 -------------------------------------------------------------
 
@@ -612,11 +638,13 @@ class _AngleDial(tk.Canvas):
     def _on_press(self, event) -> None:
         if self._disabled:
             return
-        if self._dist(event.x, event.y) < self._radius() * self.DEAD_RATIO:
-            # 圆心附近：方向对角度的敏感度趋于无穷，点一下值会乱跳 —— 干脆不起拖
-            return
+        if self._in_dead_zone(event.x, event.y):
+            return          # 圆心附近不起拖（取值不稳定），_apply 里还会再挡一次
         self._press = True
         self._apply(event)
+
+    def _in_dead_zone(self, x: float, y: float) -> bool:
+        return self._dist(x, y) < self._radius() * self.DEAD_RATIO
 
     def _on_drag(self, event) -> None:
         if self._disabled or not self._press:
@@ -632,9 +660,19 @@ class _AngleDial(tk.Canvas):
         self._redraw()
 
     def _apply(self, event) -> None:
+        # 死区对**拖动**同样生效：只挡「按下」的话，一旦起拖后把鼠标滑过圆心，
+        # 值就会以 7°/px 的速度疯跳 —— 与死区存在的初衷自相矛盾。
+        if self._in_dead_zone(event.x, event.y):
+            return
         value = self._value_of(event.x, event.y)
-        if event.state & 0x1:          # Shift 掩码
-            value = round(value / self.SNAP_DEG) * self.SNAP_DEG
+        if event.state & self.ALT_MASK:        # Alt：不吸附，交给 quantize 按步长取整
+            pass
+        elif event.state & self.SHIFT_MASK:    # Shift：15°（对齐平铺角度）
+            value = round(value / self.SNAP_SHIFT) * self.SNAP_SHIFT
+        else:                                  # 默认：5°，好命中 0 / 30 / 45
+            value = round(value / self.SNAP_DEFAULT) * self.SNAP_DEFAULT
+        if self._quantize is not None:
+            value = self._quantize(value)
         self._value = min(max(value, self._lo), self._hi)
         self._redraw()
         if self._cmd is not None:
@@ -862,13 +900,17 @@ class SliderField(tk.Frame):
     def __init__(self, parent, label: str, lo: float, hi: float, value: float,
                  step: float, command: Callable[[float], None], unit: str = "",
                  decimals: int = 0, show_entry: bool = True, hint: Optional[str] = None,
-                 dial: bool = False, bg: str = PANEL) -> None:
+                 dial: bool = False, cyclic: bool = False, bg: str = PANEL) -> None:
         # ``dial=True``：把线性滑块换成**圆盘**（见 ``_AngleDial``）。只给
         # 「旋转角度」用 —— 角度是循环量，圆环天然首尾相接；其余三个量是单向
         # 大小，线性轨道才对。字段的其余部分（标签 / 数字框 / 步进三角 / 校验）
         # 完全共用，所以这里只是一个绘制策略开关。
         super().__init__(parent, bg=bg)
         self._lo, self._hi, self._step = float(lo), float(hi), float(step)
+        # 循环量（角度）：合法化是**取模**而不是钳制 —— 否则步进器走到上界就被
+        # 卡死（0° 永远回不到 -1°），手输 350° 还会被夹成 180°，方向直接变了。
+        # 圆盘只用于循环量，故 dial=True 即隐含 cyclic=True。
+        self._cyclic = bool(cyclic) or bool(dial)
         self._decimals = int(decimals)
         self._command = command
         self._bg = bg
@@ -926,7 +968,8 @@ class SliderField(tk.Frame):
         if dial:
             # 圆盘是固定方形，**不能** fill="x"：横向拉满会把圆拉成椭圆
             self.scale = _AngleDial(self, from_=self._lo, to=self._hi,
-                                    command=self._on_scale, bg=bg)
+                                    command=self._on_scale, bg=bg,
+                                    quantize=self._snap)
             self.scale.set(self._value)
             self.scale.pack(pady=(px(SP_SM), 0))
         else:
@@ -1017,7 +1060,18 @@ class SliderField(tk.Frame):
 
     def _snap(self, value: float) -> float:
         step = self._step if self._step > 0 else 1.0
-        return min(max(round(value / step) * step, self._lo), self._hi)
+        v = round(value / step) * step
+        if self._cyclic:
+            span = self._hi - self._lo
+            if span > 0:
+                v = self._lo + math.fmod(v - self._lo, span)
+                if v < self._lo:      # fmod 对负数返回负值，得再绕一圈（如 -190 -> 170）
+                    v += span
+                # 半开半闭 (lo, hi]：绕回下界时取上界，与 spec.wrap_deg 一致
+                # （角度 -180 与 180 是同一方向，统一显示 180）
+                if abs(v - self._lo) < 1e-9:
+                    v = self._hi
+        return min(max(v, self._lo), self._hi)
 
     def _on_scale(self, raw: str) -> None:
         try:

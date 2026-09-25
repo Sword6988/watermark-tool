@@ -403,13 +403,17 @@ def test_spec_clamping_never_raises():
     assert spec.font_family.strip()
     assert spec.font_pct == 0.5
     assert spec.margin_pct == 20.0
-    assert spec.angle == 0.0
+    # 角度是**循环量**，合法范围内原样保留：-30° 不再被夹成 0°（那等于改了方向）
+    assert spec.angle == -30.0
     assert spec.opacity == 1.0
     assert spec.color == "#d32f2f"
 
     assert WatermarkSpec(font_pct="abc").normalized().font_pct == 4.0
     assert WatermarkSpec(opacity=None).normalized().opacity == 0.30
-    assert WatermarkSpec(angle=10 ** 9).normalized().angle == 360.0
+    # 循环归一而不是钳制：1e9 % 360 = 280 -> -80（同一个方向），不是夹到上界 180
+    assert WatermarkSpec(angle=10 ** 9).normalized().angle == -80.0
+    assert WatermarkSpec(angle=350).normalized().angle == -10.0
+    assert WatermarkSpec(angle=360).normalized().angle == 0.0
     assert WatermarkSpec().lines() == ["机密文件"]
     assert WatermarkSpec(text="a\nb").lines() == ["a", "b"]
 

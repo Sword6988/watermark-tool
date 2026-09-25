@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -35,7 +36,13 @@ LINE_SPACING: float = 1.15
 
 FONT_PCT_RANGE: Tuple[float, float] = (0.5, 30.0)
 MARGIN_PCT_RANGE: Tuple[float, float] = (0.0, 20.0)
-ANGLE_RANGE: Tuple[float, float] = (0.0, 360.0)
+#: 角度是**循环量**：0° 与 360° 是同一个方向。区间取 ``(-180, 180]``（半开半闭，
+#: 180 保持 180 不被翻成 -180），目的只有一个 —— 把「数值不连续的那一点」（循环量
+#: 单值表示必然存在的一处接缝）**挪到 ±180**，也就是「文字完全倒置」这个最少用到
+#: 的方向上去。旧值域 0–360 把接缝压在 12 点方向 = 0°（水平，最常用的方向），
+#: 拖过那里数字会 359→0 横跳。
+#: 渲染侧对负角与等价正角完全一致（``PIL.Image.rotate`` 支持负数）。
+ANGLE_RANGE: Tuple[float, float] = (-180.0, 180.0)
 #: 不透明度的**内部**表示：0–1 的 alpha，渲染直接吃这个值（序列化格式不变）
 OPACITY_RANGE: Tuple[float, float] = (0.05, 1.0)
 #: 不透明度的**界面显示**区间：百分比 5 % – 100 %（与内部 alpha 相差 100 倍）
@@ -74,6 +81,24 @@ _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 def clamp(value: float, lo: float, hi: float) -> float:
     """把 ``value`` 夹到 ``[lo, hi]`` 区间。"""
     return lo if value < lo else (hi if value > hi else value)
+
+
+def wrap_deg(value: Any, default: float = DEFAULT_ANGLE) -> float:
+    """把任意角度归一到 ``(-180, 180]`` —— **循环量的正确合法化方式**。
+
+    角度不能用 ``clamp``：350° 被夹成 180° 是**把方向改掉了**（前者几乎水平，
+    后者完全倒置）。取模才能守住建好的契约「同一个方向 = 同一个数」：
+
+        360 -> 0      350 -> -10     -190 -> 170     180 -> 180
+
+    ``180`` 保持 ``180`` 而不翻成 ``-180``（半开半闭区间），这样 ±180 只有一个端点值。
+    """
+    ang = math.fmod(to_float(value, default), 360.0)
+    if ang > 180.0:
+        ang -= 360.0
+    elif ang <= -180.0:
+        ang += 360.0
+    return 0.0 if ang == 0.0 else ang   # 消掉 -0.0（否则界面会显示「-0」）
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -164,7 +189,7 @@ class WatermarkSpec:
             font_family=family,
             font_pct=clamp(to_float(self.font_pct, DEFAULT_FONT_PCT), *FONT_PCT_RANGE),
             margin_pct=clamp(to_float(self.margin_pct, DEFAULT_MARGIN_PCT), *MARGIN_PCT_RANGE),
-            angle=clamp(to_float(self.angle, DEFAULT_ANGLE), *ANGLE_RANGE),
+            angle=wrap_deg(self.angle),
             opacity=clamp(to_float(self.opacity, DEFAULT_OPACITY), *OPACITY_RANGE),
             color=normalize_color(self.color),
         )
@@ -216,6 +241,7 @@ __all__ = [
     "opacity_to_pct",
     "opacity_from_pct",
     "clamp",
+    "wrap_deg",
     "to_float",
     "normalize_color",
 ]
