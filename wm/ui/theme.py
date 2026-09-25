@@ -405,6 +405,122 @@ class FlatScale(tk.Canvas):
         return states
 
 
+class _HoverStepper(tk.Canvas):
+    """数字框右侧的悬停步进器（上下两个三角）。
+
+    仅当鼠标悬停于「输入框 / 步进器 / 单位」这一组合上时显现，移开即隐藏。
+    设计要点：
+
+    * **始终占位**：控件常驻（固定宽度），只切换「画 / 不画」——因此显隐时输入框
+      与单位不会左右跳动（比 ``pack/pack_forget`` 更稳，交互更"安静"）。
+    * 上下两半各自独立热区，命中区比图形略大，便于点中。
+    * 命中态用主题色高亮对应三角，给出即时反馈。
+    * ``takefocus=0``：点击不夺走输入框焦点，用户可继续手动输入。
+
+    ``boxed=False`` 用于「嵌入数字框」形态（方案 C）：此时外层容器已经画了边框，
+    步进器只画一层浅色底 + 三角，**不再描边**，避免双线。
+    """
+
+    W = 13          # 逻辑宽
+
+    def __init__(self, parent, command, bg: str = PANEL, boxed: bool = True) -> None:
+        self._cw = px(self.W)
+        self._ch = px(20)
+        super().__init__(parent, width=self._cw, height=self._ch, bg=bg,
+                         highlightthickness=0, bd=0, takefocus=0)
+        self._command = command        # Callable[[int], None]：+1 上，-1 下
+        self._bg = bg
+        self._boxed = bool(boxed)
+        self._visible = False
+        self._zone = 0                 # 0 无 / +1 上半 / -1 下半
+        self._enabled = True
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", self._on_leave)
+        self._redraw()
+
+    # -- 外部控制 ---------------------------------------------------------
+
+    def set_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._visible:
+            return
+        self._visible = visible
+        if not visible:
+            self._zone = 0
+        self._redraw()
+
+    def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        if not enabled:
+            self._zone = 0
+        self._redraw()
+
+    def set_height(self, height: int) -> None:
+        """跟随输入框实际高度，保证两者落在同一水平线上。"""
+        height = max(px(14), int(height))
+        if height == self._ch:
+            return
+        self._ch = height
+        self.configure(height=height)
+        self._redraw()
+
+    # -- 内部 -------------------------------------------------------------
+
+    def _half(self, y: int) -> int:
+        """按纵向位置判定命中的是上半（+1）还是下半（-1）。"""
+        return 1 if y < self._ch / 2 else -1
+
+    def _on_motion(self, event) -> None:
+        zone = self._half(event.y) if self._enabled else 0
+        if zone != self._zone:
+            self._zone = zone
+            self.configure(cursor="hand2" if self._enabled else "")
+            self._redraw()
+
+    def _on_leave(self, _event=None) -> None:
+        if self._zone:
+            self._zone = 0
+            self._redraw()
+
+    def _on_click(self, event) -> None:
+        if self._enabled and self._command is not None:
+            self._command(self._half(event.y))
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        if not self._visible or not self._enabled:
+            return
+        w, h = self._cw, self._ch
+        if self._boxed:
+            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER, outline=FIELD_LINE)
+        else:
+            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER, outline="")
+        pad = px(3)
+        mid = h / 2
+        gap = px(1)
+        up_fill = ACCENT if self._zone == 1 else TEXT_DIM
+        dn_fill = ACCENT if self._zone == -1 else TEXT_DIM
+        self.create_polygon([w / 2, pad, w - pad, mid - gap, pad, mid - gap],
+                            fill=up_fill, outline=up_fill)
+        self.create_polygon([pad, mid + gap, w - pad, mid + gap, w / 2, h - pad],
+                            fill=dn_fill, outline=dn_fill)
+
+
+def _with_unit(label: str, unit: str) -> str:
+    """把单位并入字段名：``("旋转角度", "°") -> "旋转角度 (°)"``。
+
+    百分号这类本身就是"每百"的单位写进括号里更自然（``字号 (%)``）；
+    角度符号同理。没有单位时原样返回。
+    """
+    if not unit:
+        return label
+    return f"{label} ({unit})"
+
+
 class SliderField(tk.Frame):
     """「标签 + 数字框 + 滑块（+ 提示）」的组合字段。"""
 
@@ -421,33 +537,52 @@ class SliderField(tk.Frame):
         self._value = min(max(float(value), self._lo), self._hi)
         self._hint_text = hint or ""
         self._invalid_job: Optional[str] = None
+        self._hover_job: Optional[str] = None
+        self._invalid = False
+        self._focused = False
 
         head = tk.Frame(self, bg=bg)
         head.pack(fill="x")
-        self.label_widget = tk.Label(head, text=label, bg=bg, fg=TEXT_DIM,
+        # 单位并入字段名（如「旋转角度 (°)」）：不再单挂一个尾部单位标签，
+        # 避免「数字框 / 步进器 / 单位」三段并排时的错位与视觉噪音。
+        self.label_widget = tk.Label(head, text=_with_unit(label, unit), bg=bg, fg=TEXT_DIM,
                                      font=(UI_FAMILY, sf(9)), anchor="w")
         self.label_widget.pack(side="left")
 
-        self.unit_label: Optional[tk.Label] = None
+        self.entry_box: Optional[tk.Frame] = None
         self.entry: Optional[tk.Entry] = None
+        self.stepper: Optional[_HoverStepper] = None
         self.var: Optional[tk.StringVar] = None
         if show_entry:
-            if unit:
-                self.unit_label = tk.Label(head, text=unit, bg=bg, fg=TEXT_FAINT,
-                                           font=(UI_FAMILY, sf(9)), anchor="e")
-                self.unit_label.pack(side="right", padx=(px(SP_XS), 0))
             self.var = tk.StringVar(value=self._format(self._value))
-            # 常驻 1px 边框：既是输入框可视边界，也承担焦点环（聚焦变 accent）
-            self.entry = tk.Entry(head, textvariable=self.var, width=5, justify="right",
-                                  bg=bg, fg=TEXT, relief="flat", bd=0,
-                                  highlightthickness=px(1), highlightbackground=FIELD_LINE,
-                                  highlightcolor=ACCENT, font=(UI_FAMILY, sf(11)))
-            self.entry.pack(side="right")
+            # 外层「框」：1px 边框由容器承担，同时充当焦点环（聚焦变 accent）；
+            # 内层 entry 与步进器都去边框，拼成一个整体，视觉上就是原生 UpDown。
+            self.entry_box = tk.Frame(head, bg=bg,
+                                      highlightthickness=px(1),
+                                      highlightbackground=FIELD_LINE,
+                                      highlightcolor=ACCENT)
+            self.entry = tk.Entry(self.entry_box, textvariable=self.var, width=5,
+                                  justify="right", bg=bg, fg=TEXT,
+                                  relief="flat", bd=0, highlightthickness=0,
+                                  insertwidth=px(1), font=(UI_FAMILY, sf(11)))
+            # 悬停步进器：嵌在框内右缘（boxed=False → 只画浅底与三角，不重复描边）
+            self.stepper = _HoverStepper(self.entry_box, command=self._spin,
+                                         bg=bg, boxed=False)
+            self.stepper.pack(side="right", padx=(0, px(2)), pady=px(2))
+            self.entry.pack(side="right", padx=(px(SP_SM), px(SP_XS)), pady=px(2))
+            self.entry_box.pack(side="right")
             self.entry.bind("<Return>", self._commit_entry)
-            self.entry.bind("<FocusOut>", self._commit_entry)
+            self.entry.bind("<FocusIn>", self._on_focus_in)
+            self.entry.bind("<FocusOut>", self._on_focus_out)
             self.entry.bind("<Up>", lambda _e: self._nudge(1))
             self.entry.bind("<Down>", lambda _e: self._nudge(-1))
             self.entry.bind("<MouseWheel>", self._on_wheel)
+            # 步进器高度跟随输入框，保证同一水平线
+            self.entry.bind("<Configure>", lambda e: self.stepper.set_height(e.height), add="+")
+            # 悬停组合：框 / 输入框 / 步进器 任一进入即显示，全部离开后延时隐藏
+            for widget in (self.entry_box, self.entry, self.stepper):
+                widget.bind("<Enter>", self._on_field_enter, add="+")
+                widget.bind("<Leave>", self._on_field_leave, add="+")
 
         self.scale = FlatScale(self, from_=self._lo, to=self._hi,
                                command=self._on_scale)
@@ -484,8 +619,9 @@ class SliderField(tk.Frame):
                 self.after_cancel(self._invalid_job)
             except Exception:
                 pass
-        if self.entry is not None:
-            self.entry.configure(highlightbackground=DANGER, highlightcolor=DANGER)
+        self._invalid = True
+        if self.entry_box is not None:
+            self.entry_box.configure(highlightbackground=DANGER, highlightcolor=DANGER)
         self.hint_label.configure(
             text=f"请输入 {self._format(self._lo)} – {self._format(self._hi)} 之间的数值",
             fg=DANGER)
@@ -494,10 +630,31 @@ class SliderField(tk.Frame):
 
     def _clear_invalid(self) -> None:
         self._invalid_job = None
-        if self.entry is not None:
-            self.entry.configure(highlightbackground=FIELD_LINE, highlightcolor=ACCENT)
+        self._invalid = False
+        self._sync_box_border()
         self.hint_label.configure(text=self._hint_text, fg=TEXT_FAINT)
         self._sync_hint_visibility()
+
+    def _sync_box_border(self) -> None:
+        """外层框边框：非法 > 聚焦 > 常态（三者优先级递减）。"""
+        if self.entry_box is None:
+            return
+        if self._invalid:
+            color = DANGER
+        elif self._focused:
+            color = ACCENT
+        else:
+            color = FIELD_LINE
+        self.entry_box.configure(highlightbackground=color, highlightcolor=color)
+
+    def _on_focus_in(self, _event=None) -> None:
+        self._focused = True
+        self._sync_box_border()
+
+    def _on_focus_out(self, _event=None) -> None:
+        self._focused = False
+        self._sync_box_border()
+        self._commit_entry()
 
     # -- 内部 -------------------------------------------------------------
 
@@ -527,7 +684,7 @@ class SliderField(tk.Frame):
         self._emit()
 
     def _nudge(self, direction: int) -> str:
-        self.set(self._value + direction * self._step)
+        self.set(self._entry_value() + direction * self._step)
         return "break"
 
     def _on_wheel(self, event):
@@ -539,20 +696,56 @@ class SliderField(tk.Frame):
             return "break"
         return None
 
-    def _commit_entry(self, _event=None) -> None:
+    def _entry_value(self) -> float:
+        """把输入框当前文本解析为**合法值**；失败则回退上次有效值并给校验提示。
+
+        步进器点击与方向键都走这里 —— 这样即使输入框**尚未失焦**（手输了一半就
+        去点三角），也会先以「手输的内容」为基准增减，而不是拿旧的内部值算。
+        """
         if self.entry is None or self.var is None:
-            return
-        raw = self.var.get().strip()
+            return self._value
         try:
-            value = self._snap(float(raw))
+            return self._snap(float(self.var.get().strip()))
         except (TypeError, ValueError, OverflowError):
             # 解析失败回退上次有效值，并给出明确的校验提示（不再静默）
             self._flag_invalid()
-            value = self._value
+            return self._value
+
+    def _commit_entry(self, _event=None) -> None:
+        if self.entry is None or self.var is None:
+            return
+        value = self._entry_value()
         self.var.set(self._format(value))
         self.scale.set(value)
         self._value = value
         self._emit()
+
+    # -- 悬停步进器 ---------------------------------------------------------
+
+    def _on_field_enter(self, _event=None) -> None:
+        """进入「输入框 / 步进器 / 单位」任一处：取消延时并显示步进器。"""
+        if self._hover_job is not None:
+            try:
+                self.after_cancel(self._hover_job)
+            except Exception:
+                pass
+            self._hover_job = None
+        if self.stepper is not None:
+            self.stepper.set_visible(True)
+
+    def _on_field_leave(self, _event=None) -> None:
+        """离开任一处：**延时**隐藏，给三者之间的移动留缓冲，避免闪烁。"""
+        if self._hover_job is None:
+            self._hover_job = self.after(120, self._hide_stepper)
+
+    def _hide_stepper(self) -> None:
+        self._hover_job = None
+        if self.stepper is not None:
+            self.stepper.set_visible(False)
+
+    def _spin(self, direction: int) -> None:
+        """步进器点击：先归一化手输内容，再按步长增减（只发一次通知）。"""
+        self.set(self._entry_value() + direction * self._step)
 
     def _emit(self) -> None:
         if self._enabled and self._command is not None:
@@ -573,7 +766,7 @@ class SliderField(tk.Frame):
             self._emit()
 
     def set_enabled(self, enabled: bool) -> None:
-        """禁用态三通道同时变淡：数值 + 标签 + 单位，滑块一并禁用。"""
+        """禁用态同时变淡：数值 + 标签，滑块与步进器一并禁用。"""
         self._enabled = bool(enabled)
         try:
             self.scale.state(["!disabled"] if enabled else ["disabled"])
@@ -582,9 +775,13 @@ class SliderField(tk.Frame):
         if self.entry is not None:
             self.entry.configure(state="normal" if enabled else "readonly",
                                  fg=TEXT if enabled else TEXT_FAINT)
+        if self.stepper is not None:
+            self.stepper.set_enabled(enabled)
         self.label_widget.configure(fg=TEXT_DIM if enabled else TEXT_MUTE)
-        if self.unit_label is not None:
-            self.unit_label.configure(fg=TEXT_FAINT if enabled else TEXT_MUTE)
+        if self.entry_box is not None and not enabled:
+            # 禁用时收起可能的焦点环，避免"灰字段 + accent 边框"打架
+            self._focused = False
+            self._sync_box_border()
 
 
 class ToggleSwitch(tk.Frame):

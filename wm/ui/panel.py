@@ -202,7 +202,7 @@ class ParamPanel(tk.Frame):
         self.color = ColorField(root, self._on_color, value=self._spec.color,
                                 presets=COLOR_PRESETS)
         self.color.pack(fill="x")
-        # 不透明度：界面按百分比 5–100 显示（右侧固定 "%" 单位），内部仍为 0.05–1.0
+        # 不透明度：界面按百分比 5–100 显示（单位 "%" 并入字段名），内部仍为 0.05–1.0
         # 的 alpha —— 两个方向都经 spec 的换算函数，越界自动夹到最近边界。
         self.opacity = SliderField(root, "不透明度", *OPACITY_PCT_RANGE,
                                    opacity_to_pct(self._spec.opacity), OPACITY_PCT_STEP,

@@ -4,16 +4,20 @@
 - 代码规模：5552 行（含测试 1571 行）
 - 基线：`tests/run_all.py` **42/42 通过**；冻结自检 4/4 PASS
 - 审计方式：架构 / 测试覆盖 / 代码质量 三个角度并行独立审计 + 交叉验证
-- **修复进度（2026-09-25）**：P0 已修 6/6、P1 已修 12/12、P2 全部完成；回归 **67/67 通过、0 SKIP**
+- **修复进度（2026-09-25）**：P0 已修 6/6、P1 已修 12/12、P2 全部完成；回归 **70/70 通过、0 SKIP**
   （连跑 8 次无 flaky）；已重新打包并通过字节级（符号级）验证。
   - 第 1 批产物：EXE md5 `ce4504633a47c7c83101b2ec55481bd7`
-  - **最终产物（含全部 5 批修复：P0-1~6、P1-1~12、P2 全部）**：EXE md5 **`39b1859228c28c55a0bee0f9ed447b69`**
-    （本批重建，目录版 68.4MB / 便携 zip 32.1MB）
-    字节级校验 **0 项不符**（新增 P0-3 分带符号 `IMAGE_BAND_PIXELS` / `IMAGE_BAND_ROWS` /
+  - 第 5 批产物（含全部修复 + 步进器 v1）：EXE md5 `728de3676c04887facb28b046b20dfce`
+  - **最新产物（含全部 5 批修复 + 数字框悬停步进器「方案 C」）**：EXE md5 **`e38fc6f6da90a65a19e37b553e4d7f42`**
+    （目录版 68.4MB / 便携 zip 32.1MB，zip md5 `fa5beaa513af52c9abf289b8e1ea4ef7`）
+  - 字节级校验 **0 项不符**（新增 P0-3 分带符号 `IMAGE_BAND_PIXELS` / `IMAGE_BAND_ROWS` /
     `_prepare_layer` / `_composite_banded`，及 P1-4 三模块 `save_image` / `write_image` /
-    `render_preview` / `run_batch` 的模块归属核对；`IMPORT_NAME` 级 `pymupdf` 正面证据仍在）；
+    `render_preview` / `run_batch` 的模块归属核对；步进器符号 `_HoverStepper` / `_spin` /
+    `_entry_value` / `entry_box` / `_with_unit` / `_sync_box_border` 均已确认在包内；
+    `IMPORT_NAME` 级 `pymupdf` 正面证据仍在）；
     冻结版 `--selftest` PASS、GUI 冒烟 4 秒存活、zip CRC 通过、`PIL/_avif*.pyd` 已不在包内。
-    回归 **67/67、0 SKIP**（60 → 67，新增 `test_banding.py` 3 条 + `test_ui_units.py` 4 条）。
+    回归 **70/70、0 SKIP**（60 → 67 为 `test_banding.py` 3 条 + `test_ui_units.py` 4 条；
+    67 → 70 为 `test_stepper.py` 3 条）。
   每个已修条目下方有「✅ 已修复」小节记录改法与实测数据。
 - 结论：**功能主干（平铺几何、两路径一致、PDF alpha、不覆盖原文件）守得很扎实，
   但存在 1 个会产出错误结果的静默缺陷，以及一整类"只在真实文件上才会踩到"的
@@ -396,6 +400,27 @@ opacity / color）**全部完备**，连续渲染不串水印。
   `tests/test_all.py` 放宽两处墙钟断言（3.0→8.0s、1.0→5.0s）消除 flaky。
 - 低优先 P2 建议（`time.sleep` 让出频率、注解/docstring 覆盖率、cache key 收敛到单函数、`from_dict` 加版本号）
   本次未做，仍列于「P2 改进建议」节，属锦上添花，不影响交付。
+
+### ✅ 交付后追加：数字框悬停步进器（方案 C）
+
+非审计条目，属交付后的交互增强。用户提出「数字框悬停时在右侧出现上下三角」，实现后按
+用户对「数字框与单位位置不美观」的反馈，改为**方案 C：步进器嵌入数字框内、单位并入字段名**。
+
+- 新增自绘控件 `_HoverStepper(tk.Canvas)`（`wm/ui/theme.py`）：常驻占位、只切换「画/不画」，
+  显隐时输入框与单位**不左右跳动**；上下两半独立热区、命中态用主题色高亮；`takefocus=0` 不夺焦点。
+  `boxed=False` 用于嵌入形态（不再重复描边）。
+- 结构：外层 `entry_box`（唯一 1px 边框，兼作焦点环）内**并排**放 `entry` 与 `stepper`，
+  不做 `place()` 覆盖 —— 因此不依赖绝对坐标、缩放/字体变化时不错位。
+- 单位并入字段名：`_with_unit()` 把 `("旋转角度","°")` 渲染成 `旋转角度 (°)`，
+  去掉了尾部独立单位标签，`panel.py` 调用点无需改动。
+- 交互细节：悬停「框 / 输入框 / 步进器」任一进入即显示，全部离开后 **120ms 延时隐藏**（防抖动）；
+  上/下三角 ±step 并在 `[lo, hi]` 钳制；**手输未提交的文本也会成为步进基准**（`_entry_value()`），
+  非法输入红框 + 提示行并按上次有效值回退。焦点环/红框状态机收敛到 `_sync_box_border()`：非法 > 聚焦 > 常态。
+- 回归：新增 `tests/test_stepper.py` 3 条（悬停/点击/钳制、手输保留、禁用不绘制），
+  全套 **70/70、0 SKIP**；`_smoke/smoke_stepper.py` 32 项全通过；`_smoke/shot_stepper.py` 真实窗口截图
+  （`stepper_on / off / angle_on / opacity_on`）确认三处字段对齐一致（框 85×32、输入框 52×26、步进器 16×26）。
+- 踩坑记录：`after_cancel` 必须用**注册该 job 的控件**（job 由 `field.after` 调度），
+  用 `root.after_cancel` 会留下悬空 Tcl 命令，`destroy()` 时报 `can't delete Tcl command`（测试侧已修正）。
 
 ---
 
