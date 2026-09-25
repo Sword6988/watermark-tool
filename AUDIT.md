@@ -638,3 +638,40 @@ tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
 - `_smoke/AUDIT_REPORT.md` —— 代码质量角度的完整报告
 - `_smoke/audit*.py` —— 各角度审计用的临时脚本（文件名不以 `test_` 开头，不会被测试 runner 收录）
 - 本次审计**未修改任何源码**（变异测试已逐字节还原并 `diff` 验证）
+
+---
+
+## 交付形态补充：单文件版（onefile，2026-09-25）
+
+用户要求「打包成一个单文件 exe」。做法：**不改源码，只加一套打包配置**——
+`EXE()` 把 `a.binaries + a.datas` 全塞进 exe、不生成 `COLLECT`。源码零改动的原因：
+onefile 运行时 `sys._MEIPASS` 就是自解压目录，而 `main.module_root()` 本就优先读它，
+图标 / tkdnd / PyMuPDF 的 DLL 全部从那里加载。
+
+新增文件：
+
+- `packaging/watermark-onefile.spec` —— 单文件 spec（与目录版只差最后一步，无 COLLECT）
+- `packaging/build_onefile.py` —— 构建 → 自检 → GUI 冒烟 → md5 清单（复用 `build.py` 的
+  `move_aside` / `prune_obsolete`，绝不 rmtree；旧产物一律移到 `build/_obsolete`）
+- `_smoke/verify_onefile.py` —— 独立验收：把 exe **单独拷进空目录**跑，断言自检全过、
+  冷启动秒数量化、`%TEMP%\_MEI*` 自解压目录存在（传目录版路径时反断言**不**生成）、
+  程序目录无旁挂文件
+
+实测（本机，Windows / PyInstaller 6.22.3 / Python 3.13.15 / Tcl 8.6）：
+
+| 项 | 单文件版 | 目录版（对照） |
+|---|---|---|
+| 产物 | `dist/WatermarkTool.exe` 32.2 MB | `dist/WatermarkTool/` 68.4 MB（zip 32.1 MB） |
+| 冷启动到主窗口 | 1.62 s | 0.62 s |
+| 自检 | 4/4 PASS（Pillow 12.3.0 / PyMuPDF 1.28.2 / tkdnd 2.10.2 / 图片改动 10.13% / PDF 3 页全有墨） | 同 |
+| 单独拷走后可运行 | ✅ 程序目录无任何旁挂 | ✅（须带 `_internal`） |
+| md5 | `53e800224c2d245b117b3474a9621f69` | `b78124647ffa83dc8e1c5903d2285397`（exe） |
+
+坑（本轮唯一踩到的）：冷启动计时一开始读出 **0.01 秒**——上一轮 GUI 冒烟的
+`WatermarkTool.exe` 进程没死透，脚本一启动就「找到」了它的残留窗口。修法：验收脚本
+启动前先 `taskkill /F /IM` 并断言无同名窗口，窗口匹配也从模糊关键词「水印」改成
+精确标题「图片 / PDF 文字水印工具」。
+
+代价/取舍（已写进 `dist/单文件版说明.txt` 与 README 第十节）：单文件每次启动要把
+~70MB 内容解压到 `%TEMP%\_MEIxxxxxx`（退出自动清理），冷启动比目录版慢约 1 秒；
+且更容易触发 SmartScreen。介意这两点就用目录版。

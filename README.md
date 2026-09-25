@@ -245,3 +245,41 @@ d.save("_smoke/in.pdf", garbage=4, deflate=True)
 d.close()
 render.render_pdf("_smoke/in.pdf", "_smoke/out.pdf", spec)
 ```
+
+---
+
+## 十、打包与分发（两种形态，任选其一）
+
+两种包**功能完全一致**，都由同一份源码、同一套 `spec_common` 依赖清单构建，
+区别只在「文件怎么摆」：
+
+| | 单文件版 | 目录版 |
+|---|---|---|
+| 产物 | `dist/WatermarkTool.exe`（1 个文件） | `dist/WatermarkTool/`（`WatermarkTool.exe` + `_internal/`） |
+| 分发 | 发一个文件即可 | 必须整个文件夹打包，丢掉 `_internal` 就起不来 |
+| 体积 | 32.2 MB（已压缩） | 68.4 MB 展开 / 32.1 MB zip |
+| 冷启动 | ≈1.6 s（每次解压到 `%TEMP%\_MEIxxxxxx`） | ≈0.6 s（直接读 `_internal`） |
+| 退出 | 自动清理临时解压目录 | 不留临时文件 |
+| SmartScreen | 相对更容易被拦 | 相对少见 |
+
+构建（必须用装了 PyInstaller + 本项目依赖的**系统 Python**，托管 Python 没有 tkinter）：
+
+```
+python packaging/build_onefile.py    # 单文件版：dist/WatermarkTool.exe
+python packaging/build.py            # 目录版：  dist/WatermarkTool/ + portable.zip
+```
+
+两个脚本都会**构建 → 自检（tkdnd / 图片 / PDF / 中文路径）→ GUI 冒烟 → 出 md5**，
+任何一步失败即拒绝交付。单文件版另有独立验收：
+
+```
+python _smoke/verify_onefile.py                              # 单文件版
+python _smoke/verify_onefile.py dist/WatermarkTool/WatermarkTool.exe   # 目录版对照
+```
+
+它把 exe **单独拷进空目录**运行，断言：自检全过、冷启动秒数被量化、
+`%TEMP%\_MEI*` 自解压目录确实生成（目录版则断言**不**生成）、程序目录无旁挂文件。
+
+单文件版的实现只有最后一步不同：`EXE()` 把 `a.binaries + a.datas` 全塞进 exe、
+不生成 `COLLECT`。源码零改动 —— 运行时 `sys._MEIPASS` 就是解压目录，
+`main.module_root()` 本就优先读它，图标 / tkdnd / PyMuPDF 的 DLL 都从那里加载。
