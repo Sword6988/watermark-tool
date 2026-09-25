@@ -107,6 +107,13 @@ BTN_BG = "#ffffff"
 BTN_BG_HOVER = "#f2f3f7"
 BTN_BG_DOWN = "#e6e7ee"
 SWITCH_OFF = "#8f92a0"
+
+#: 数字框步进三角（**常驻显示**，三级状态）：常态淡到"存在但不抢戏"，
+#: 悬停字段加深提示可点，命中上/下半区转主题色。禁用态比常态更淡且无反馈。
+STEP_IDLE = TEXT_MUTE
+STEP_HOVER = TEXT_DIM
+STEP_ACTIVE = ACCENT
+STEP_OFF = "#c2c5cf"
 SWITCH_OFF_HOVER = "#787b8a"
 FOCUS = "#0f6cbd"
 BADGE_OK = "#0f7b3f"
@@ -405,20 +412,28 @@ class FlatScale(tk.Canvas):
         return states
 
 
-class _HoverStepper(tk.Canvas):
-    """数字框右侧的悬停步进器（上下两个三角）。
+class _Stepper(tk.Canvas):
+    """数字框右缘的步进三角（上下两个），**常驻显示**。
 
-    仅当鼠标悬停于「输入框 / 步进器 / 单位」这一组合上时显现，移开即隐藏。
-    设计要点：
+    为什么不是「悬停才显示」：那样不悬停时数字框右缘会显得空落落，而且用户
+    看不出这个数字是可以点着改的（可发现性差）。改成常驻后，用**三级状态**
+    代替显隐开关，保证「一直在」又「不抢戏」：
 
-    * **始终占位**：控件常驻（固定宽度），只切换「画 / 不画」——因此显隐时输入框
-      与单位不会左右跳动（比 ``pack/pack_forget`` 更稳，交互更"安静"）。
+    ==================  ==========================================
+    常态                淡灰 ``STEP_IDLE``，安静地提示这里可点
+    悬停在字段上        ``STEP_HOVER`` 加深，确认"能交互"
+    命中上 / 下半区     ``STEP_ACTIVE`` 主题色 + 浅底，即时反馈
+    禁用                ``STEP_OFF`` 更淡，且不响应悬停与点击
+    ==================  ==========================================
+
+    其它要点：
+
+    * **始终占位**：固定宽度、状态切换只改颜色 —— 绝不引起布局跳动。
     * 上下两半各自独立热区，命中区比图形略大，便于点中。
-    * 命中态用主题色高亮对应三角，给出即时反馈。
     * ``takefocus=0``：点击不夺走输入框焦点，用户可继续手动输入。
 
     ``boxed=False`` 用于「嵌入数字框」形态（方案 C）：此时外层容器已经画了边框，
-    步进器只画一层浅色底 + 三角，**不再描边**，避免双线。
+    命中时只铺一层浅色底 **不描边**，避免双线。
     """
 
     W = 13          # 逻辑宽
@@ -431,7 +446,7 @@ class _HoverStepper(tk.Canvas):
         self._command = command        # Callable[[int], None]：+1 上，-1 下
         self._bg = bg
         self._boxed = bool(boxed)
-        self._visible = False
+        self._hover = False            # 鼠标是否在「输入框 / 步进器 / 外框」上
         self._zone = 0                 # 0 无 / +1 上半 / -1 下半
         self._enabled = True
         self.bind("<Button-1>", self._on_click)
@@ -441,13 +456,15 @@ class _HoverStepper(tk.Canvas):
 
     # -- 外部控制 ---------------------------------------------------------
 
-    def set_visible(self, visible: bool) -> None:
-        visible = bool(visible)
-        if visible == self._visible:
+    def set_hover(self, hover: bool) -> None:
+        """切换「悬停」态：只改三角深浅，三角本身始终在。"""
+        hover = bool(hover)
+        if hover == self._hover:
             return
-        self._visible = visible
-        if not visible:
+        self._hover = hover
+        if not hover:
             self._zone = 0
+            self.configure(cursor="")
         self._redraw()
 
     def set_enabled(self, enabled: bool) -> None:
@@ -457,6 +474,7 @@ class _HoverStepper(tk.Canvas):
         self._enabled = enabled
         if not enabled:
             self._zone = 0
+            self.configure(cursor="")
         self._redraw()
 
     def set_height(self, height: int) -> None:
@@ -482,6 +500,7 @@ class _HoverStepper(tk.Canvas):
             self._redraw()
 
     def _on_leave(self, _event=None) -> None:
+        # 只清「命中半区」；是否悬停由 SliderField 的悬停组统一判定
         if self._zone:
             self._zone = 0
             self._redraw()
@@ -490,20 +509,26 @@ class _HoverStepper(tk.Canvas):
         if self._enabled and self._command is not None:
             self._command(self._half(event.y))
 
+    def _fills(self) -> Tuple[str, str]:
+        """返回 (上三角色, 下三角色)：禁用 > 命中 > 悬停 > 常态。"""
+        if not self._enabled:
+            return STEP_OFF, STEP_OFF
+        base = STEP_HOVER if self._hover else STEP_IDLE
+        up = STEP_ACTIVE if self._zone == 1 else base
+        dn = STEP_ACTIVE if self._zone == -1 else base
+        return up, dn
+
     def _redraw(self) -> None:
         self.delete("all")
-        if not self._visible or not self._enabled:
-            return
         w, h = self._cw, self._ch
-        if self._boxed:
-            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER, outline=FIELD_LINE)
-        else:
-            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER, outline="")
+        # 命中半区才铺浅底（整块铺会让常态也变成一块"按钮"，太吵）
+        if self._enabled and self._zone:
+            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER,
+                       outline=FIELD_LINE if self._boxed else "")
         pad = px(3)
         mid = h / 2
         gap = px(1)
-        up_fill = ACCENT if self._zone == 1 else TEXT_DIM
-        dn_fill = ACCENT if self._zone == -1 else TEXT_DIM
+        up_fill, dn_fill = self._fills()
         self.create_polygon([w / 2, pad, w - pad, mid - gap, pad, mid - gap],
                             fill=up_fill, outline=up_fill)
         self.create_polygon([pad, mid + gap, w - pad, mid + gap, w / 2, h - pad],
@@ -551,7 +576,7 @@ class SliderField(tk.Frame):
 
         self.entry_box: Optional[tk.Frame] = None
         self.entry: Optional[tk.Entry] = None
-        self.stepper: Optional[_HoverStepper] = None
+        self.stepper: Optional[_Stepper] = None
         self.var: Optional[tk.StringVar] = None
         if show_entry:
             self.var = tk.StringVar(value=self._format(self._value))
@@ -565,9 +590,9 @@ class SliderField(tk.Frame):
                                   justify="right", bg=bg, fg=TEXT,
                                   relief="flat", bd=0, highlightthickness=0,
                                   insertwidth=px(1), font=(UI_FAMILY, sf(11)))
-            # 悬停步进器：嵌在框内右缘（boxed=False → 只画浅底与三角，不重复描边）
-            self.stepper = _HoverStepper(self.entry_box, command=self._spin,
-                                         bg=bg, boxed=False)
+            # 常驻步进器：嵌在框内右缘（boxed=False → 命中时不重复描边）
+            self.stepper = _Stepper(self.entry_box, command=self._spin,
+                                    bg=bg, boxed=False)
             self.stepper.pack(side="right", padx=(0, px(2)), pady=px(2))
             self.entry.pack(side="right", padx=(px(SP_SM), px(SP_XS)), pady=px(2))
             self.entry_box.pack(side="right")
@@ -723,7 +748,7 @@ class SliderField(tk.Frame):
     # -- 悬停步进器 ---------------------------------------------------------
 
     def _on_field_enter(self, _event=None) -> None:
-        """进入「输入框 / 步进器 / 单位」任一处：取消延时并显示步进器。"""
+        """进入「外框 / 输入框 / 步进器」任一处：取消延时并让三角加深。"""
         if self._hover_job is not None:
             try:
                 self.after_cancel(self._hover_job)
@@ -731,17 +756,20 @@ class SliderField(tk.Frame):
                 pass
             self._hover_job = None
         if self.stepper is not None:
-            self.stepper.set_visible(True)
+            self.stepper.set_hover(True)
 
     def _on_field_leave(self, _event=None) -> None:
-        """离开任一处：**延时**隐藏，给三者之间的移动留缓冲，避免闪烁。"""
-        if self._hover_job is None:
-            self._hover_job = self.after(120, self._hide_stepper)
+        """离开任一处：**延时**取消加深，给三者之间的移动留缓冲，避免闪烁。
 
-    def _hide_stepper(self) -> None:
+        注意：这里**不隐藏**三角 —— 三角是常驻的，只是从"加深"回到"淡灰"。
+        """
+        if self._hover_job is None:
+            self._hover_job = self.after(120, self._unhover_stepper)
+
+    def _unhover_stepper(self) -> None:
         self._hover_job = None
         if self.stepper is not None:
-            self.stepper.set_visible(False)
+            self.stepper.set_hover(False)
 
     def _spin(self, direction: int) -> None:
         """步进器点击：先归一化手输内容，再按步长增减（只发一次通知）。"""
@@ -750,6 +778,27 @@ class SliderField(tk.Frame):
     def _emit(self) -> None:
         if self._enabled and self._command is not None:
             self._command(self._value)
+
+    def destroy(self) -> None:
+        """销毁前先撤掉挂在**自己**身上的延时任务。
+
+        否则定时器仍留在 Tk 队列里，到点会去调一个已被 ``Misc.destroy`` 删掉的
+        Tcl 命令 —— 进不了 Python，只在 Tcl 后台留一条
+        ``invalid command name "..."`` 噪声（实测偶发 1/7）。现在无害，但只要
+        将来有人把 job 改挂到 root，就会变成"操作已销毁控件"的真异常。
+
+        注意 ``after_cancel`` 必须用 ``self``（谁调度谁取消）—— 这正是本文件
+        注释里记过的历史坑。
+        """
+        for attr in ("_hover_job", "_invalid_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        super().destroy()
 
     # -- 公共 API ---------------------------------------------------------
 

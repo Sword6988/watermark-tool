@@ -8,16 +8,18 @@
   （连跑 8 次无 flaky）；已重新打包并通过字节级（符号级）验证。
   - 第 1 批产物：EXE md5 `ce4504633a47c7c83101b2ec55481bd7`
   - 第 5 批产物（含全部修复 + 步进器 v1）：EXE md5 `728de3676c04887facb28b046b20dfce`
-  - **最新产物（含全部 5 批修复 + 数字框悬停步进器「方案 C」）**：EXE md5 **`e38fc6f6da90a65a19e37b553e4d7f42`**
-    （目录版 68.4MB / 便携 zip 32.1MB，zip md5 `fa5beaa513af52c9abf289b8e1ea4ef7`）
+  - 方案 C 产物（步进器嵌入数字框 + 单位并入字段名）：EXE md5 `e38fc6f6da90a65a19e37b553e4d7f42`
+  - **最新产物（含全部 5 批修复 + 常驻步进三角 + 测试基建修复）**：EXE md5 **`6cdf7878fedc8d57411bf5654ae0ba39`**
+    （目录版 68.4MB / 便携 zip 32.1MB，zip md5 `fadec7fc84f008893d9aa48263ee1664`）
   - 字节级校验 **0 项不符**（新增 P0-3 分带符号 `IMAGE_BAND_PIXELS` / `IMAGE_BAND_ROWS` /
     `_prepare_layer` / `_composite_banded`，及 P1-4 三模块 `save_image` / `write_image` /
     `render_preview` / `run_batch` 的模块归属核对；步进器符号 `_HoverStepper` / `_spin` /
     `_entry_value` / `entry_box` / `_with_unit` / `_sync_box_border` 均已确认在包内；
     `IMPORT_NAME` 级 `pymupdf` 正面证据仍在）；
     冻结版 `--selftest` PASS、GUI 冒烟 4 秒存活、zip CRC 通过、`PIL/_avif*.pyd` 已不在包内。
-    回归 **70/70、0 SKIP**（60 → 67 为 `test_banding.py` 3 条 + `test_ui_units.py` 4 条；
-    67 → 70 为 `test_stepper.py` 3 条）。
+    回归 **71/71、0 SKIP、0 FAIL（连跑 3 次稳定）**
+    （60 → 67 为 `test_banding.py` 3 条 + `test_ui_units.py` 4 条；
+    67 → 71 为 `test_stepper.py` 4 条）。
   每个已修条目下方有「✅ 已修复」小节记录改法与实测数据。
 - 结论：**功能主干（平铺几何、两路径一致、PDF alpha、不覆盖原文件）守得很扎实，
   但存在 1 个会产出错误结果的静默缺陷，以及一整类"只在真实文件上才会踩到"的
@@ -406,21 +408,104 @@ opacity / color）**全部完备**，连续渲染不串水印。
 非审计条目，属交付后的交互增强。用户提出「数字框悬停时在右侧出现上下三角」，实现后按
 用户对「数字框与单位位置不美观」的反馈，改为**方案 C：步进器嵌入数字框内、单位并入字段名**。
 
-- 新增自绘控件 `_HoverStepper(tk.Canvas)`（`wm/ui/theme.py`）：常驻占位、只切换「画/不画」，
-  显隐时输入框与单位**不左右跳动**；上下两半独立热区、命中态用主题色高亮；`takefocus=0` 不夺焦点。
-  `boxed=False` 用于嵌入形态（不再重复描边）。
+- 新增自绘控件 `_Stepper(tk.Canvas)`（`wm/ui/theme.py`）：**三角常驻显示**，用「三级状态」
+  代替显隐开关 —— 常态 `STEP_IDLE` 淡灰 / 悬停 `STEP_HOVER` 加深 / 命中半区 `STEP_ACTIVE`
+  主题色 + 浅底 / 禁用 `STEP_OFF` 更淡。
+  *（v1 是"悬停才显示、移开即隐藏"，用户实测反馈"不悬停时数字框空唠唠"，遂改常驻：
+    可发现性更强，且状态切换只改颜色、绝不引起布局跳动。）*
+  上下两半独立热区、`takefocus=0` 不夺焦点；`boxed=False` 用于嵌入形态（不再重复描边）。
 - 结构：外层 `entry_box`（唯一 1px 边框，兼作焦点环）内**并排**放 `entry` 与 `stepper`，
   不做 `place()` 覆盖 —— 因此不依赖绝对坐标、缩放/字体变化时不错位。
 - 单位并入字段名：`_with_unit()` 把 `("旋转角度","°")` 渲染成 `旋转角度 (°)`，
   去掉了尾部独立单位标签，`panel.py` 调用点无需改动。
-- 交互细节：悬停「框 / 输入框 / 步进器」任一进入即显示，全部离开后 **120ms 延时隐藏**（防抖动）；
-  上/下三角 ±step 并在 `[lo, hi]` 钳制；**手输未提交的文本也会成为步进基准**（`_entry_value()`），
-  非法输入红框 + 提示行并按上次有效值回退。焦点环/红框状态机收敛到 `_sync_box_border()`：非法 > 聚焦 > 常态。
-- 回归：新增 `tests/test_stepper.py` 3 条（悬停/点击/钳制、手输保留、禁用不绘制），
-  全套 **70/70、0 SKIP**；`_smoke/smoke_stepper.py` 32 项全通过；`_smoke/shot_stepper.py` 真实窗口截图
-  （`stepper_on / off / angle_on / opacity_on`）确认三处字段对齐一致（框 85×32、输入框 52×26、步进器 16×26）。
+- 交互细节：悬停「框 / 输入框 / 步进器」任一进入即加深，全部离开后 **120ms 延时回落**（防抖动，
+  三角**不消失**）；上/下三角 ±step 并在 `[lo, hi]` 钳制；**手输未提交的文本也会成为步进基准**
+  （`_entry_value()`），非法输入红框 + 提示行并按上次有效值回退。焦点环/红框状态机收敛到
+  `_sync_box_border()`：非法 > 聚焦 > 常态。
+- 配色新增 4 个令牌 `STEP_IDLE/HOVER/ACTIVE/OFF`（集中在 `theme.py`，控件内无字面色值）。
+- 回归：新增 `tests/test_stepper.py` 4 条（常驻+三级状态、手输保留、状态切换不挪布局、禁用更淡且不响应），
+  全套 **71/71、0 SKIP**（步进器用例 3 → 4 条）；`_smoke/smoke_stepper.py` 39 项全通过；`_smoke/shot_stepper.py` 真实窗口截图
+  （`stepper_idle / hover / hit / angle_idle / opacity_idle`）确认三处字段对齐一致
+  （框 85×32、输入框 52×26、步进器 16×26）。
 - 踩坑记录：`after_cancel` 必须用**注册该 job 的控件**（job 由 `field.after` 调度），
   用 `root.after_cancel` 会留下悬空 Tcl 命令，`destroy()` 时报 `can't delete Tcl command`（测试侧已修正）。
+
+### ✅ 交付后追加（同日）：三角改为**常驻显示**
+
+用户实测反馈"三角是不是一直显示比较好，不然鼠标没有悬停的时候，数字框感觉空唠唠的"。
+采纳 —— 常驻的可发现性确实更强（不悬停也能看出这个数字可以点着改）。
+
+- `_HoverStepper` 更名 `_Stepper`（"Hover"已不准确），**移除显隐开关**，改用三级状态：
+  `STEP_IDLE` 淡灰 → `STEP_HOVER` 悬停加深 → `STEP_ACTIVE` 命中半区转主题色并铺浅底
+  → `STEP_OFF` 禁用更淡。新增 4 个配色令牌，仍集中在 `theme.py`。
+- **始终占位、只改颜色**：状态切换绝不引起布局跳动（新增用例专门守这条）。
+- 浅底只在**命中半区**出现；整块常铺会让它变成一块常驻"按钮"，太吵。
+
+### ✅ 顺带修掉两个测试基建缺陷（一个会误报连带失败，一个会让用例莫名超时）
+
+现象：一轮回归里 `test_banded_cancels_between_bands` 超时 30s，紧接着
+`test_qa_image_and_pdf_paths_agree_multi` 报"两路径偏差 2.5"（阈值 2）。
+
+根因不在被测代码，而在**看门狗**：`tests/run_all.py` 用 daemon 线程 + `join(timeout)`
+实现超时，超时后主线程继续，但**被中断用例的 `finally` 永远不会执行**。
+`test_banding.py` 正是靠 `finally` 把 `IMAGE_SS_MAX_PIXELS` / `IMAGE_BAND_PIXELS`
+改回原值的 —— 一超时，这两个常量就被永久改写成 0 / 1，后续所有图片渲染都
+不再超采样，与 PDF 路径（恒 2×）的 bbox 偏差自然超过 2px。
+（该用例单独跑 12 次全过，确认是被污染而非真缺陷。）
+
+修法（两层）：
+1. `tests/run_all.py` 新增 `GUARDED_GLOBALS` + `_baseline_globals()`：
+   **每个用例开始前**把 `wm.render` 的常量复原到导入时的基线；超时时先给 5s 宽限
+   让它自己跑完 `finally`，再兜底复原。
+2. `tests/test_banding.py::test_banded_cancels_between_bands` 本身写错了：
+   `IMAGE_BAND_PIXELS` 只决定"是否走带路径"，**每带行数由 `IMAGE_BAND_ROWS` 决定**，
+   所以原写法（只压前者）根本没制造出多条带，取消实际是在**进带循环之前**触发的，
+   "带与带之间"从未被真正验证。改为同时压 `IMAGE_BAND_ROWS = 1`，并把取消阈值
+   从 3 提到 8（前 4 次是准备阶段的检查点），断言"取消必须发生在带循环内"。
+   顺带把图从 1500×1500 降到 900×900（实测 0.01–0.18s，原超时系环境抖动）。
+
+#### ⚠️ 缺陷 2：用例"莫名超时 30s" —— Tk 跨线程 `__del__` 死锁
+
+修完上面那条后它**仍然**超时，而且把 A 修好之后失败点会**漂移**到别的用例
+（`test_qa_batch_isolation_and_monotonic_progress`）—— 典型的竞态特征。
+给看门狗加了"超时即 dump 卡住线程的调用栈"（`sys._current_frames()`），一击命中：
+
+```
+numpy/random/_pickle.py:7    from .mtrand import RandomState
+...
+tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
+```
+
+机理：本运行器把每个用例放在**子线程**里跑，而 Tk 解释器**绑定在创建它的线程**上。
+前序 GUI 用例销毁 root 后，`tkinter.font.Font` 之类变成只能由 GC 回收的循环垃圾；
+一旦 GC 在**另一个**用例线程里跑起来，其 `__del__` 就会跨线程调用 Tcl
+（`font delete`）→ Tcl 永久阻塞 → 该用例被看门狗判为超时。
+单独跑 0.01s、完整回归里必挂，且"挂哪一条"随导入时机漂移。
+
+修法（两层，前一层缓解、后一层掐断触发机制）：
+1. `tests/run_all.py` 新增 `PRELOAD_MODULES` + `_preload_heavy_modules()`：
+   在**主线程、尚无 Tk 残留时**把 `numpy.random` / PIL / fitz 等重量级扩展模块
+   预导入完毕，消除"用例线程里首次导入 .pyd 触发 GC"这一时机。
+   （实测有效：banding 不再超时，但失败点漂移 → 说明还没治本。）
+2. `tests/run_all.py` 运行期间 `gc.disable()`：这类对象在一轮内不再被回收，
+   跨线程 `__del__` 的路径直接消失。引用计数能清的对象照清（测试里的大对象
+   基本都是引用计数回收），实测内存与耗时无异常。
+   修后连跑 **3 次 71/71、0 SKIP、0 FAIL**。
+
+**仍属规避，非治本**：只要还有"子线程里创建并销毁 Tk"，这个竞态就还在。
+彻底方案是让每个用例跑在**独立子进程**里（超时直接 kill），顺带把下面那条
+"常量污染"问题也一并解决 —— 已列入后续建议，本轮不动。
+
+#### ✅ 产品侧顺带加固（来自独立验证同事的建议）
+
+- `SliderField.destroy()`：销毁前用 `self.after_cancel()` 撤掉 `_hover_job` /
+  `_invalid_job`。现状无害，但定时器到点会去调已被删除的 Tcl 命令，留下
+  （实测约 1/7 概率）`invalid command name` 的后台噪声；若将来把 job 改挂到
+  root，就会升级成"操作已销毁控件"的真异常。零风险、明确收益，采纳。
+- 未采纳：`_Stepper._on_click` 在上下界钳制时不发通知（消掉一次无意义重绘）。
+  属行为变更，收益有限，暂不动，只在此记录。
+- 测试断言强化：`_tris()` 改为**按质心 y 判定上下三角**（原按绘制顺序），
+  并据顶点数剔除浅底 —— 绘制顺序变化时断言不再失效。
 
 ---
 

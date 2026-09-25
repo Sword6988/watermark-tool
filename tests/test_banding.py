@@ -70,25 +70,43 @@ def test_banded_for_large_image_correct():
 
 
 def test_banded_cancels_between_bands():
-    """带路径在带与带之间应响应取消回调。"""
+    """带路径在**带与带之间**应响应取消回调。
+
+    两个容易搞错的点（第一版就写错了，特此写明）：
+
+    1. ``IMAGE_BAND_PIXELS`` 只决定「是否走带路径」，**每带多少行由
+       ``IMAGE_BAND_ROWS`` 决定**。只把前者压到 1 并不会产生"极多极小的带" ——
+       1500px 图仍只有 ``ceil(1500/1024) = 2`` 带，带循环里最多检查 2 次，
+       取消其实是在准备阶段触发的，"带之间"根本没被验证到。必须同时压
+       ``IMAGE_BAND_ROWS``。
+    2. 取消阈值要**绕过准备阶段**的检查点：``render_image`` 进入时 + convert 后
+       各 1 次，``_prepare_layer`` 开头 + 块位图渲染后各 1 次 —— 共 4 次。
+       阈值取 8，第 5~7 次落在带 1~3（放行，带被真正合成），第 8 次在带 4 前
+       抛出，以此证明"带与带之间能中断"（而不是进带循环之前就中断）。
+    """
     saved_ss = render.IMAGE_SS_MAX_PIXELS
     saved_band = render.IMAGE_BAND_PIXELS
+    saved_rows = render.IMAGE_BAND_ROWS
     try:
         render.IMAGE_SS_MAX_PIXELS = 0      # factor == 1（带路径前提）
-        render.IMAGE_BAND_PIXELS = 1         # 极多极小的带 → 多次进入循环
+        render.IMAGE_BAND_PIXELS = 0        # 带路径永远被选中
+        render.IMAGE_BAND_ROWS = 1          # 每行一带 → 900 次带循环
         spec = WatermarkSpec(font_pct=4.0, margin_pct=3.0, angle=30.0).normalized()
         counter = {"n": 0}
-        is_cancelled = lambda: (counter.__setitem__("n", counter["n"] + 1) or counter["n"] >= 3)
+        is_cancelled = lambda: (counter.__setitem__("n", counter["n"] + 1) or counter["n"] >= 8)
 
         raised = False
         try:
-            render.render_image(_rand_img(1500, 1500), spec, scale=1.0,
-                                 is_cancelled=is_cancelled)
+            render.render_image(_rand_img(900, 900), spec, scale=1.0,
+                                is_cancelled=is_cancelled)
         except render.Cancelled:
             raised = True
 
         assert raised, "带路径未响应取消回调（应抛 Cancelled）"
-        assert counter["n"] >= 1, "取消回调从未被调用"
+        # 4 次准备 + 至少 1 次带循环 = 取消必须发生在带循环里，否则计数到不了 5
+        assert counter["n"] >= 5, f"取消发生在进带循环之前（只检查了 {counter['n']} 次）"
+        assert counter["n"] == 8, f"应在第 8 次检查时中断，实际 {counter['n']}"
     finally:
         render.IMAGE_SS_MAX_PIXELS = saved_ss
         render.IMAGE_BAND_PIXELS = saved_band
+        render.IMAGE_BAND_ROWS = saved_rows
