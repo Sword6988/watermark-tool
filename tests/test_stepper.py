@@ -38,25 +38,38 @@ def _make_field(root):
     return field, calls
 
 
-def _tris(sp):
-    """返回 (上三角 fill, 下三角 fill)，**按质心 y 判定上下**而非绘制顺序。
+def _img(sp):
+    """取步进器当前渲染的位图（paint_aa 存在 ``_aa_image`` 上）。"""
+    img = getattr(sp, "_aa_image", None)
+    assert img is not None, "步进器应已渲染出抗锯齿位图（paint_aa）"
+    return img
 
-    命中半区时画布上还会多一层浅底。浅底是 ``round_rect`` 的平滑多边形，顶点数
-    远多于三角（20 vs 6），据此剔除顶点最多的那项；剩下的按质心 y 升序即为
-    「上、下」。这样即使以后绘制顺序变了，断言依然成立。
-    """
-    items = sp.find_all()
-    assert len(items) >= 2, "步进三角应常驻绘制（至少两个图元）"
-    polys = []
-    for item in items:
-        coords = list(map(float, sp.coords(item)))
-        ys = coords[1::2]
-        polys.append((sum(ys) / len(ys), len(coords), item))
-    most = max(p[1] for p in polys)
-    tris = [p for p in polys if p[1] < most] if len(polys) > 2 else polys
-    tris.sort(key=lambda p: p[0])
-    assert len(tris) == 2, f"应恰好两个三角，实际 {len(tris)}（图元 {len(items)} 个）"
-    return sp.itemcget(tris[0][2], "fill"), sp.itemcget(tris[1][2], "fill")
+
+def _pix(img, fx, fy):
+    """按**比例**取样：fx/fy ∈ [0,1]，测试不依赖具体 DPI 下的像素尺寸。"""
+    x = min(img.width - 1, max(0, int(round(fx * img.width))))
+    y = min(img.height - 1, max(0, int(round(fy * img.height))))
+    return img.getpixel((x, y))
+
+
+def _hex2rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _near(c, ref, tol=30):
+    return all(abs(c[i] - ref[i]) <= tol for i in range(3))
+
+
+# 上/下三角的内部采样点（比例坐标）：上三角质心约 (0.5, 0.35)，下三角约 (0.5, 0.68)；
+# 两者之间的缝隙带 y≈0.5 —— 命中浅底画不画，看这里就知道。
+_UP, _DN, _GAP = (0.5, 0.35), (0.5, 0.68), (0.5, 0.5)
+
+
+def _tris(sp):
+    """返回 (上三角 RGB, 下三角 RGB)，按内部采样点取色。"""
+    img = _img(sp)
+    return _pix(img, *_UP), _pix(img, *_DN)
 
 
 def _click(field, frac):
@@ -78,15 +91,18 @@ def test_stepper_always_drawn_with_three_hover_states():
 
         # 1) 常态：三角已在（不悬停也不空），且没有浅底
         up, dn = _tris(sp)
-        assert up == T.STEP_IDLE and dn == T.STEP_IDLE, (up, dn)
-        assert len(sp.find_all()) == 2, "常态不应铺浅底"
+        idle = _hex2rgb(T.STEP_IDLE)
+        assert _near(up, idle) and _near(dn, idle), (up, dn)
+        bgc = _hex2rgb(T.PANEL)
+        assert _near(_pix(_img(sp), *_GAP), bgc), "常态不应铺浅底"
 
         # 2) 悬停字段：两个三角一起加深
         field.entry.event_generate("<Enter>")
         field.update()
         assert sp._hover is True, "悬停应置 hover 态"
         up, dn = _tris(sp)
-        assert up == T.STEP_HOVER and dn == T.STEP_HOVER, (up, dn)
+        hover = _hex2rgb(T.STEP_HOVER)
+        assert _near(up, hover) and _near(dn, hover), (up, dn)
         assert field.entry.winfo_height() == sp._ch, "步进器高度应等于输入框"
 
         # 3) 命中上半区：上三角转主题色，并铺出浅底
@@ -94,8 +110,10 @@ def test_stepper_always_drawn_with_three_hover_states():
                           y=max(2, sp._ch // 4))
         field.update()
         up, dn = _tris(sp)
-        assert up == T.STEP_ACTIVE and dn == T.STEP_HOVER, (up, dn)
-        assert len(sp.find_all()) == 3, "命中半区应铺浅底"
+        active = _hex2rgb(T.STEP_ACTIVE)
+        assert _near(up, active) and _near(dn, hover), (up, dn)
+        row_hover = _hex2rgb(T.ROW_HOVER)
+        assert _near(_pix(_img(sp), *_GAP), row_hover), "命中半区应铺浅底"
 
         # 4) 加减速与上下界钳制
         _click(field, 0.25)   # 上半 → +1
@@ -120,8 +138,8 @@ def test_stepper_always_drawn_with_three_hover_states():
             time.sleep(0.01)
         assert sp._hover is False, "移开后应退出 hover 态"
         up, dn = _tris(sp)
-        assert up == T.STEP_IDLE and dn == T.STEP_IDLE, (up, dn)
-        assert len(sp.find_all()) == 2, "移开后三角仍在（常驻），只是回到淡灰"
+        assert _near(up, idle) and _near(dn, idle), (up, dn)
+        assert _near(_pix(_img(sp), *_GAP), bgc), "移开后浅底应退去（三角仍常驻）"
     finally:
         root.destroy()
 
@@ -191,18 +209,19 @@ def test_stepper_disabled_is_dimmed_and_inert():
         field.set_enabled(False)
         assert sp._enabled is False, "禁用后步进器应禁用"
         up, dn = _tris(sp)
-        assert up == T.STEP_OFF and dn == T.STEP_OFF, (up, dn)
+        off = _hex2rgb(T.STEP_OFF)
+        assert _near(up, off) and _near(dn, off), (up, dn)
 
         before = field.get()
         sp.event_generate("<Motion>", x=max(2, sp._cw // 2), y=max(2, sp._ch // 4))
         _click(field, 0.25)
-        assert len(sp.find_all()) == 2, "禁用态不铺浅底"
+        assert _near(_pix(_img(sp), *_GAP), _hex2rgb(T.PANEL)), "禁用态不铺浅底"
         assert abs(field.get() - before) <= 1e-9, "禁用态点击不应改值"
 
         field.set_enabled(True)
         assert sp._enabled is True, "恢复启用后应可交互"
         up, _ = _tris(sp)
-        assert up == T.STEP_IDLE, "恢复后应回到常态色"
+        assert _near(up, _hex2rgb(T.STEP_IDLE)), "恢复后应回到常态色"
         _click(field, 0.25)
         assert abs(field.get() - (before + 1)) <= 1e-9, "恢复后点击应生效"
     finally:

@@ -10,9 +10,10 @@
   - 第 5 批产物（含全部修复 + 步进器 v1）：EXE md5 `728de3676c04887facb28b046b20dfce`
   - 方案 C 产物（步进器嵌入数字框 + 单位并入字段名）：EXE md5 `e38fc6f6da90a65a19e37b553e4d7f42`
   - 常驻步进三角产物：EXE md5 `6cdf7878fedc8d57411bf5654ae0ba39`
-  - **最新产物（上述 + 「旋转角度」圆盘控件）**：EXE md5 **`cec06a5567fbe7e8b34a39e27b031709`**
-    （目录版 68.4MB / 便携 zip 32.1MB，zip md5 `f076bbf2776d8cfbc9c4deef4838c888`，
-    打包 **68.9 秒**；字节级已确认 `_AngleDial` / `_value_of` / `DIAL_RING` / `SNAP_DEG` / `dial` 在包内）
+  - 圆盘产物：EXE md5 `cec06a5567fbe7e8b34a39e27b031709`
+  - **最新产物（上述 + 图形 4× 超采样抗锯齿）**：EXE md5 **`b78124647ffa83dc8e1c5903d2285397`**
+    （目录版 68.4MB / 便携 zip 32.1MB，zip md5 `47e3be0824283d8e71b07551a1d82478`，
+    打包 **68.0 秒**；字节级已确认 `paint_aa` / `AA_SS` / `_aa_image` 在包内）
   - 字节级校验 **0 项不符**（新增 P0-3 分带符号 `IMAGE_BAND_PIXELS` / `IMAGE_BAND_ROWS` /
     `_prepare_layer` / `_composite_banded`，及 P1-4 三模块 `save_image` / `write_image` /
     `render_preview` / `run_batch` 的模块归属核对；步进器符号 `_HoverStepper` / `_spin` /
@@ -545,6 +546,39 @@ tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
 > 记录一个方法学坑：`_smoke/shot_dial.py` 起初截图整体偏移，根因是脚本**没有调用
 > `theme.enable_dpi_awareness()`** —— 非 DPI 感知进程里 Tk 报的是虚拟坐标，而
 > `ImageGrab` 用物理像素，两者差一个缩放比。截图脚本必须先做 DPI 初始化。
+
+### ✅ 交付后追加（同日）：图形渲染清晰度 —— **4× 超采样抗锯齿**
+
+用户反馈自绘的圆形、线条、箭头「边缘发虚、不够锐利」。排查结论：不是坐标精度问题，
+**是 Tk canvas 在 Windows 上走 GDI 直绘、图元完全没有抗锯齿** ——
+实测一整幅圆盘只有 **4 种纯色、0% 过渡色**，圆环与方向线的边缘全是锯齿台阶
+（125% DPI 下台阶间距不均，观感即「发虚」）。canvas 图元没有任何抗锯齿参数可调。
+
+**方案：PIL 4× 超采样渲染**（新增 `paint_aa(canvas, painter, bg)`，`AA_SS = 4`）：
+在 4 倍尺寸位图上重画同几何图形（坐标与描边宽度一并 ×4），LANCZOS 缩回 1x，
+等效盒式滤波抗锯齿 —— 几何 / 颜色 / 尺寸 / 布局与原画法完全一致，只有边缘质量不同。
+改前改后截图（`_smoke/sharp_before.png` / `sharp_after.png`）对比明显：
+改前圆环是硬台阶，改后是平滑圆弧。性能实测单次渲染 0.2～2.8ms，拖动无感。
+
+- 覆盖控件：`_AngleDial`（圆环 / 方向线 / 箭头 / 手柄）、`FlatScale`（轨道 / 滑块）、
+  `ToggleSwitch`（胶囊 / 旋钮）、`_Stepper`（三角）、`FluentButton`（圆角边框；
+  **文字保持原生图元**，Tk 字体渲染本身是次像素级，比位图缩放更锐）。
+  色块（纯色矩形）与预览画布本就无锯齿，未动。
+- `round_rect()` 去掉 `smooth=True`：那会把全部顶点当控制点拟合样条，
+  **直边也会被画成微弯曲线**；改为 4 段直线 + 4 段真实圆弧（每角 8 段，偏差 <0.05px）。
+- 渲染结果同时挂在 `canvas._aa_image`（PIL Image），供测试做**像素级断言** ——
+  比原先的画布图元内省更强：断言的是「实际画出来的颜色」而非「画布项属性」。
+- 配套修复：`ToggleSwitch` / `FluentButton` 补 `<Configure>` 重画
+  （位图渲染依赖画布实际尺寸，映射前 winfo 是占位值，否则首帧空白）；
+  `paint_aa` 在 winfo 未就绪时退回 `-width/-height` 选项。
+- 测试改造：`test_stepper.py` / `test_angle_dial.py` 从图元内省改为像素采样
+  （按比例取样，不依赖 DPI；斜线断言沿线扫一小段取最小色距，
+  因为 AA 下斜线的亚像素过渡是正常表现，单点取纯色过严）。
+  smoke 39 项全过；回归 **77/77、0 SKIP、0 FAIL**。
+- **未采纳**「按 devicePixelRatio 缩放画布再恢复坐标系」：那是 HTML canvas 位图
+  画法的做法；Tk canvas 是矢量绘制、坐标即物理像素，DPR 缩放只会把坐标放大
+  4 倍再画同样的矢量图，不会更清晰。真正的 DPR 对应项（进程 DPI 感知声明）
+  本来就在 `enable_dpi_awareness()` 里做了。
 
 ---
 

@@ -56,12 +56,55 @@ def _pts(dial, value):
     return c + math.cos(rad) * r, c - math.sin(rad) * r
 
 
-def _line_coords(dial):
-    """取出方向线（type == 'line'）的坐标；找不到即断言失败。"""
-    for item in dial.find_all():
-        if dial.type(item) == "line":
-            return [float(v) for v in dial.coords(item)]
-    raise AssertionError("圆盘上找不到方向线图元")
+def _img(dial):
+    """取圆盘当前渲染的位图（``paint_aa`` 存在 ``_aa_image`` 上）。"""
+    img = getattr(dial, "_aa_image", None)
+    assert img is not None, "圆盘应已渲染出抗锯齿位图（paint_aa）"
+    return img
+
+
+def _pix(img, x, y):
+    return img.getpixel((min(img.width - 1, max(0, int(round(x)))),
+                         min(img.height - 1, max(0, int(round(y))))))
+
+
+def _hex2rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _near(c, ref, tol=45):
+    return all(abs(c[i] - ref[i]) <= tol for i in range(3))
+
+
+def _line_dist(dial, value, side, span=(0.30, 0.65)):
+    """``value`` 方向半轴上、距圆心 ``side``×半径 附近「最接近线色」的 L1 距离。
+
+    斜线经抗锯齿渲染后，单个采样点可能落在亚像素过渡带上（AA 的正常表现），
+    所以沿线扫一小段、在 ±1px 邻域里取**最小**色距 —— 线存在时必有像素落在
+    描边中心（≈纯色），不存在时只能取到背景色（距离很大）。
+    """
+    from wm.ui import theme as T
+    img = _img(dial)
+    ref = _hex2rgb(T.DIAL_LINE)
+    c, r = dial._center(), dial._radius()
+    rad = math.radians(value)
+    ux, uy = math.cos(rad), -math.sin(rad)
+    best = 10 ** 9
+    steps = 9
+    for i in range(steps):
+        t = span[0] + (span[1] - span[0]) * i / (steps - 1)
+        x, y = c + ux * r * t, c + uy * r * t
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                p = _pix(img, x + dx, y + dy)
+                best = min(best, sum(abs(p[k] - ref[k]) for k in range(3)))
+    return best
+
+
+#: 线存在 / 不存在的 L1 色距门槛：纯线色 0，纯背景 ≈496，中间是 AA 过渡
+_ON = 90
+_OFF = 300
 
 
 def test_dial_maps_click_position_to_angle():
@@ -97,35 +140,36 @@ def test_dial_maps_click_position_to_angle():
 
 def test_dial_direction_line_follows_angle():
     """方向线必须真的跟着角度转 —— 这是「线即文字走向」承诺的守门人。"""
+    from wm.ui import theme as T
     root = _root()
     try:
         dial, _ = _make_dial(root)
+        c, r = dial._center(), dial._radius()
+        bgc = _hex2rgb(T.PANEL)
 
         dial.set(0)
-        x0, y0, x1, y1 = _line_coords(dial)
-        assert abs(y1 - y0) <= 1.0, f"0° 应为水平线，实际 {y0}->{y1}"
-        assert x1 > x0, "0° 的正方向应朝屏幕右侧（与水印文字走向一致）"
+        img = _img(dial)
+        # 0°：正方向（右半轴）应是线；正上方不应有线
+        assert _line_dist(dial, 0, 1) <= _ON, "0° 的正方向应朝屏幕右侧（与水印文字走向一致）"
+        assert _line_dist(dial, 90, 1) >= _OFF, "0° 时正上方不应有线"
 
         dial.set(90)
-        x0, y0, x1, y1 = _line_coords(dial)
-        assert abs(x1 - x0) <= 1.0, f"90° 应为竖直线，实际 {x0}->{x1}"
-        assert y1 < y0, "90° 的正方向应朝屏幕上方（逆时针为正）"
+        assert _line_dist(dial, 90, 1) <= _ON, "90° 的正方向应朝屏幕上方（逆时针为正）"
+        assert _line_dist(dial, 0, 1) >= _OFF, "90° 时右侧半轴不应有线"
 
-        # 「贯穿圆心」的正确判据有两条，缺一不可：
-        #   a) 圆心落在**这条线**上（点到直线距离 ≈ 0）——注意不能拿「中点」判，
-        #      正方向那条要一直伸到箭头尖端，所以线本身就是**非对称**的；
-        #   b) 两个端点分居圆心两侧（说明是贯穿，而非从圆心单侧发出）。
-        c = dial._center()
+        # 「贯穿圆心」的判据：正、反两个方向的半轴上**都**有线的颜色
+        # （不能只验一侧 —— 单侧射线也过圆心，但不是「贯穿」）。
         for value in (0, 37, 120, 300):
             dial.set(value)
-            x0, y0, x1, y1 = _line_coords(dial)
-            dx, dy = x1 - x0, y1 - y0
-            length = math.hypot(dx, dy)
-            assert length > 0, "方向线长度不应为 0"
-            dist = abs(dx * (c - y0) - dy * (c - x0)) / length
-            assert dist <= 1.0, f"{value}° 的圆心到方向线距离 {dist:.2f}px（应 ≈0）"
-            cross = (x0 - c) * (x1 - c) + (y0 - c) * (y1 - c)
-            assert cross < 0, f"{value}° 的方向线未贯穿圆心（两端同侧）"
+            assert _line_dist(dial, value, 1) <= _ON, f"{value}° 正方向半轴应有线"
+            assert _line_dist(dial, value + 180, 1) <= _ON, \
+                f"{value}° 的反向半轴应有线（应贯穿圆心，而非单侧射线）"
+
+        # 圆环完好性：0° 时 12 点钟处应是环色而非底色
+        dial.set(0)
+        assert _near(_pix(_img(dial), c, c - r), _hex2rgb(T.DIAL_RING)), \
+            "圆环应在 12 点钟位置完好可见"
+        assert not _near(_pix(_img(dial), c, c - r), bgc), "圆环不应缺失"
     finally:
         root.destroy()
 
@@ -201,18 +245,19 @@ def test_dial_disabled_is_dimmed_and_inert():
     try:
         dial, calls = _make_dial(root, value=30)
 
-        def ring_fill():
-            for item in dial.find_all():
-                if dial.type(item) == "oval":
-                    return dial.itemcget(item, "outline")
-            raise AssertionError("圆盘上找不到圆环图元")
+        def ring_color():
+            """圆环 12 点钟处的像素色（30° 时手柄在 2 点钟方向，不会遮挡）。"""
+            img = _img(dial)
+            c, r = dial._center(), dial._radius()
+            return _pix(img, c, c - r)
 
-        assert ring_fill() == T.DIAL_RING, ring_fill()
+        assert _near(ring_color(), _hex2rgb(T.DIAL_RING)), ring_color()
         assert dial.state() == (), "初始应为启用态"
 
         dial.state(["disabled"])
         assert dial._disabled is True
-        assert ring_fill() == T.DIAL_RING_OFF, "禁用态圆环应变淡"
+        assert _near(ring_color(), _hex2rgb(T.DIAL_RING_OFF)), \
+            f"禁用态圆环应变淡，实际 {ring_color()!r}"
 
         before = dial.get()
         calls.clear()
@@ -224,7 +269,7 @@ def test_dial_disabled_is_dimmed_and_inert():
 
         dial.state(["!disabled"])
         assert dial._disabled is False
-        assert ring_fill() == T.DIAL_RING, "恢复启用后配色应复原"
+        assert _near(ring_color(), _hex2rgb(T.DIAL_RING)), "恢复启用后配色应复原"
     finally:
         root.destroy()
 

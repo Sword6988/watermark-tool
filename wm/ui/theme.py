@@ -20,6 +20,7 @@ from typing import Callable, List, Optional, Tuple
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
+from PIL import Image, ImageDraw, ImageTk
 
 from .. import fonts
 
@@ -166,12 +167,87 @@ def mix(color1: str, color2: str, t: float) -> str:
 
 
 def round_rect(canvas: tk.Canvas, x0, y0, x1, y1, r=0, **kw):
-    """Canvas 上画圆角矩形；r<=0 时退化为普通矩形（保留同一套调用）。"""
+    """Canvas 上画圆角矩形；r<=0 时退化为普通矩形（保留同一套调用）。
+
+    **不用** ``smooth=True``：那会把所有顶点当控制点拟合贝塞尔样条，
+    直边也会被画成微弯的曲线、整体发虚；这里改为「4 段直线 + 4 段真实
+    圆弧逼近（每角 8 段，最大偏差 < 0.05px）」，边缘与调用方给的几何严格一致。
+    """
+    r = min(float(r), (x1 - x0) / 2.0, (y1 - y0) / 2.0)
     if r <= 0:
         return canvas.create_rectangle(x0, y0, x1, y1, **kw)
-    points = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
-              x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-    return canvas.create_polygon(points, smooth=True, **kw)
+    # 屏幕系 y 向下：四角圆心 + 各自的起止角（-90°=正上，0°=正右，…）
+    corners = (
+        (x1 - r, y0 + r, -90.0, 0.0),     # 右上
+        (x1 - r, y1 - r, 0.0, 90.0),      # 右下
+        (x0 + r, y1 - r, 90.0, 180.0),    # 左下
+        (x0 + r, y0 + r, 180.0, 270.0),   # 左上
+    )
+    points: List[float] = []
+    for cx, cy, a0, a1 in corners:
+        for i in range(9):
+            a = math.radians(a0 + (a1 - a0) * i / 8.0)
+            points.append(cx + r * math.cos(a))
+            points.append(cy + r * math.sin(a))
+    return canvas.create_polygon(points, **kw)
+
+
+#: 抗锯齿超采样倍率。4x 下用 LANCZOS 缩回 1x，等效盒式滤波：
+#: 边缘获得约 1px 的过渡带，圆 / 斜线 / 三角不再有 GDI 直绘的锯齿台阶。
+AA_SS = 4
+
+try:                                    # Pillow >= 9.1 的枚举写法，旧版退回常量
+    _RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:                  # pragma: no cover
+    _RESAMPLE = Image.LANCZOS
+
+
+def paint_aa(canvas: tk.Canvas,
+             painter: Callable[[ImageDraw.ImageDraw, Callable[[float], int]], None],
+             bg: str = PANEL) -> None:
+    """把 ``painter`` 画的矢量图形以 **4x 超采样 + LANCZOS 缩小**贴到画布上。
+
+    **为什么需要它**：Tk canvas 在 Windows 上走 GDI 直绘，椭圆 / 斜线 /
+    多边形**完全没有抗锯齿**（实测一整幅圆盘只有 4 种纯色、0% 过渡色），
+    圆环和方向线的边缘全是锯齿台阶 —— 这就是「发虚」观感的来源，而
+    canvas 图元没有任何抗锯齿参数可调。
+
+    **做法**：在 ``AA_SS`` 倍尺寸的位图上重画同几何图形（坐标与描边宽度
+    一并放大），再 LANCZOS 缩回 1x 贴成单个 image 图元。几何 / 颜色 /
+    尺寸与原画法完全一致，只有边缘质量不同。PIL 本身同样无抗锯齿，
+    平滑感全部来自超采样 —— 这正是可复现、可预期的部分。
+
+    约定：
+
+    * ``painter(draw, s)`` 接收 Pillow 的 ``ImageDraw`` 与坐标缩放函数
+      ``s``（内部完成 ``×AA_SS`` 并取整）；**所有坐标与描边宽度都必须过
+      ``s``**，否则会出现 4 倍错位或 1/4 粗细。
+    * 整幅位图先铺 ``bg`` 再画图 —— 画布底色由此接管，画布上如需文字等
+      原生图元（如 FluentButton），应在 ``paint_aa`` **之后**创建。
+    * 渲染结果同时存到 ``canvas._aa_image``（PIL Image），供测试与探针做
+      像素级断言；PhotoImage 引用挂在 ``canvas._aa_photo`` 上防 GC。
+    """
+    w, h = int(canvas.winfo_width()), int(canvas.winfo_height())
+    if w <= 1 or h <= 1:
+        # 尚未布局（winfo 还是占位值）：退回画布的 -width/-height 选项。
+        # 没设尺寸的画布（如 FlatScale，靠 <Configure> 驱动）在这里退出。
+        try:
+            w = int(round(float(canvas["width"])))
+            h = int(round(float(canvas["height"])))
+        except Exception:
+            return
+        if w <= 1 or h <= 1:
+            return
+    ss = AA_SS
+    img = Image.new("RGB", (w * ss, h * ss), bg)
+    draw = ImageDraw.Draw(img)
+    painter(draw, lambda v: int(round(v * ss)))
+    small = img.resize((w, h), _RESAMPLE)
+    photo = ImageTk.PhotoImage(small, master=canvas)
+    canvas._aa_image = small            # 测试 / 探针的像素断言入口
+    canvas._aa_photo = photo            # 持引用，防止 PhotoImage 被 GC 后图消失
+    canvas.delete("aa")
+    canvas.create_image(0, 0, anchor="nw", image=photo, tags="aa")
 
 
 # ---------------------------------------------------------------------------
@@ -389,27 +465,34 @@ class FlatScale(tk.Canvas):
             knob_line = ACCENT_DOWN if self._press else (ACCENT_HOVER if self._hover else ACCENT)
             shadow_c = KNOB_SHADOW
 
-        # 未填充轨道（整条，带描边以便在白底上可辨）
-        top, bottom = cy - th / 2.0, cy + th / 2.0
-        round_rect(self, pad, top, right, bottom, r=th / 2.0,
-                   fill=track_c, outline=edge_c, width=px(1))
-        # 已填充轨道：从起点到滑块中心 —— 与未填充段形成明确区分
-        if kx > pad + 0.5:
-            # 半径按实际长度钳制：填充段极短时 r 若超过半宽，圆角会画歪
-            round_rect(self, pad, top, kx, bottom, r=min(th / 2.0, (kx - pad) / 2.0),
-                       fill=fill_c, outline=fill_c)
-
         r = px(self.KNOB) / 2.0
-        # 悬停 / 按下时加一圈柔光，强化「可拖动」的可供性
-        if not self._disabled and (self._hover or self._press):
-            self.create_oval(kx - r - px(3), cy - r - px(3), kx + r + px(3), cy + r + px(3),
-                             outline=ACCENT_DIM, width=px(2))
-        # 投影：先画一个下移 1px 的暗色圆，本体覆盖后底部留一道月牙 —— 浮起感
-        self.create_oval(kx - r, cy - r + px(1), kx + r, cy + r + px(1),
-                         fill=shadow_c, outline=shadow_c)
-        # 本体：白底 + 主题色描边，与灰色轨道强对比
-        self.create_oval(kx - r, cy - r, kx + r, cy + r,
-                         fill=knob_fill, outline=knob_line, width=px(self.RING))
+        glow = not self._disabled and (self._hover or self._press)
+        ring_w = px(self.RING)
+
+        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            # 未填充轨道（整条，带描边以便在白底上可辨）
+            d.rounded_rectangle([s(pad), s(cy - th / 2.0), s(right), s(cy + th / 2.0)],
+                                radius=s(th / 2.0), fill=track_c,
+                                outline=edge_c, width=s(px(1)))
+            # 已填充轨道：从起点到滑块中心 —— 与未填充段形成明确区分
+            if kx > pad + 0.5:
+                # 半径按实际长度钳制：填充段极短时 r 若超过半宽，圆角会画歪
+                d.rounded_rectangle([s(pad), s(cy - th / 2.0), s(kx), s(cy + th / 2.0)],
+                                    radius=s(min(th / 2.0, (kx - pad) / 2.0)),
+                                    fill=fill_c)
+            # 悬停 / 按下时加一圈柔光，强化「可拖动」的可供性
+            if glow:
+                d.ellipse([s(kx - r - px(3)), s(cy - r - px(3)),
+                           s(kx + r + px(3)), s(cy + r + px(3))],
+                          outline=ACCENT_DIM, width=s(px(2)))
+            # 投影：先画一个下移 1px 的暗色圆，本体覆盖后底部留一道月牙 —— 浮起感
+            d.ellipse([s(kx - r), s(cy - r + px(1)), s(kx + r), s(cy + r + px(1))],
+                      fill=shadow_c)
+            # 本体：白底 + 主题色描边，与灰色轨道强对比
+            d.ellipse([s(kx - r), s(cy - r), s(kx + r), s(cy + r)],
+                      fill=knob_fill, outline=knob_line, width=s(ring_w))
+
+        paint_aa(self, paint, bg=self._bg_color)
 
     # -- 公共 API（与 ttk.Scale 保持兼容的最小集） ------------------------
 
@@ -476,6 +559,7 @@ class _AngleDial(tk.Canvas):
                          highlightthickness=0, bd=0, cursor="hand2", takefocus=0)
         self._lo, self._hi = float(from_), float(to)
         self._cmd = command
+        self._bg_color = bg
         self._value = self._lo
         self._hover = False
         self._press = False
@@ -571,42 +655,47 @@ class _AngleDial(tk.Canvas):
             ring_c, line_c, arrow_c = DIAL_RING, DIAL_LINE, DIAL_ARROW
             knob_edge, knob_fill = DIAL_KNOB_EDGE, KNOB
 
-        # 轨道圆环（循环量：一整圈，无端点）
-        self.create_oval(c - r, c - r, c + r, c + r,
-                         outline=ring_c, width=px(DIAL_RING_W))
-
-        # 方向线：贯穿圆心。正方向一直画到**箭头尖端**（中间一段被手柄盖住），
-        # 负方向只探出圈外一小段 —— 与参考图一致：线"穿过"手柄，端头才是箭头。
-        # 若只画到手柄就停、箭头另起一段，箭头会紧贴圆环像根"刺"。
         base = r + px(self.KNOB) + px(self.ARROW_GAP)
         tip = base + px(self.ARROW_LEN)
         over = px(self.LINE_OVER)
-        self.create_line(c - ux * (r + over), c - uy * (r + over),
-                         c + ux * tip, c + uy * tip,
-                         fill=line_c, width=px(2))
-
-        # 箭头：整个落在手柄**外侧**
         half = px(self.ARROW_HALF)
-        bx, by = c + ux * base, c + uy * base
-        nx, ny = -uy, ux              # 法向（右手系转 90°）
-        self.create_polygon(c + ux * tip, c + uy * tip,
-                            bx + nx * half, by + ny * half,
-                            bx - nx * half, by - ny * half,
-                            fill=arrow_c, outline="")
-
-        # 手柄：白底 + 彩描边，压在圆环与方向线的交点上
         kr = px(self.KNOB)
         kx, ky = c + ux * r, c + uy * r
-        if not self._disabled and (self._hover or self._press):
-            # 悬停 / 按下：一圈柔光，强化「这里可以拖」
-            self.create_oval(kx - kr - px(3), ky - kr - px(3),
-                             kx + kr + px(3), ky + kr + px(3),
-                             outline=ACCENT_DIM, width=px(2))
+        glow = not self._disabled and (self._hover or self._press)
         shadow = KNOB_OFF if self._disabled else KNOB_SHADOW
-        self.create_oval(kx - kr, ky - kr + px(1), kx + kr, ky + kr + px(1),
-                         fill=shadow, outline=shadow)
-        self.create_oval(kx - kr, ky - kr, kx + kr, ky + kr,
-                         fill=knob_fill, outline=knob_edge, width=px(2))
+        ring_w = px(DIAL_RING_W)
+
+        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            # 轨道圆环（循环量：一整圈，无端点）
+            d.ellipse([s(c - r), s(c - r), s(c + r), s(c + r)],
+                      outline=ring_c, width=s(ring_w))
+
+            # 方向线：贯穿圆心。正方向一直画到**箭头尖端**（中间一段被手柄盖住），
+            # 负方向只探出圈外一小段 —— 与参考图一致：线"穿过"手柄，端头才是箭头。
+            d.line([s(c - ux * (r + over)), s(c - uy * (r + over)),
+                    s(c + ux * tip), s(c + uy * tip)],
+                   fill=line_c, width=s(px(2)))
+
+            # 箭头：整个落在手柄**外侧**
+            bx, by = c + ux * base, c + uy * base
+            nx, ny = -uy, ux              # 法向（右手系转 90°）
+            d.polygon([s(c + ux * tip), s(c + uy * tip),
+                       s(bx + nx * half), s(by + ny * half),
+                       s(bx - nx * half), s(by - ny * half)],
+                      fill=arrow_c)
+
+            # 手柄：白底 + 彩描边，压在圆环与方向线的交点上
+            if glow:
+                # 悬停 / 按下：一圈柔光，强化「这里可以拖」
+                d.ellipse([s(kx - kr - px(3)), s(ky - kr - px(3)),
+                           s(kx + kr + px(3)), s(ky + kr + px(3))],
+                          outline=ACCENT_DIM, width=s(px(2)))
+            d.ellipse([s(kx - kr), s(ky - kr + px(1)),
+                       s(kx + kr), s(ky + kr + px(1))], fill=shadow)
+            d.ellipse([s(kx - kr), s(ky - kr), s(kx + kr), s(ky + kr)],
+                      fill=knob_fill, outline=knob_edge, width=s(px(2)))
+
+        paint_aa(self, paint, bg=self._bg_color)
 
     # -- 公共 API（与 FlatScale 同构，便于无差别替换） ---------------------
 
@@ -736,17 +825,24 @@ class _Stepper(tk.Canvas):
         self.delete("all")
         w, h = self._cw, self._ch
         # 命中半区才铺浅底（整块铺会让常态也变成一块"按钮"，太吵）
-        if self._enabled and self._zone:
-            round_rect(self, 0, 0, w, h, r=px(3), fill=ROW_HOVER,
-                       outline=FIELD_LINE if self._boxed else "")
+        hit_bg = self._enabled and self._zone
         pad = px(3)
         mid = h / 2
         gap = px(1)
         up_fill, dn_fill = self._fills()
-        self.create_polygon([w / 2, pad, w - pad, mid - gap, pad, mid - gap],
-                            fill=up_fill, outline=up_fill)
-        self.create_polygon([pad, mid + gap, w - pad, mid + gap, w / 2, h - pad],
-                            fill=dn_fill, outline=dn_fill)
+
+        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            if hit_bg:
+                d.rounded_rectangle([0, 0, s(w), s(h)], radius=s(px(3)),
+                                    fill=ROW_HOVER,
+                                    outline=FIELD_LINE if self._boxed else None,
+                                    width=s(px(1)))
+            d.polygon([s(w / 2), s(pad), s(w - pad), s(mid - gap), s(pad), s(mid - gap)],
+                      fill=up_fill)
+            d.polygon([s(pad), s(mid + gap), s(w - pad), s(mid + gap), s(w / 2), s(h - pad)],
+                      fill=dn_fill)
+
+        paint_aa(self, paint, bg=self._bg)
 
 
 def _with_unit(label: str, unit: str) -> str:
@@ -1083,6 +1179,8 @@ class ToggleSwitch(tk.Frame):
             widget.bind("<Button-1>", self._toggle)
             widget.bind("<Enter>", self._on_enter)
             widget.bind("<Leave>", self._on_leave)
+        # 位图渲染依赖画布实际尺寸：映射前 winfo 是占位值，Configure 后重画一次
+        self.canvas.bind("<Configure>", lambda _e: self._redraw())
         self._redraw()
 
     def _toggle(self, _event=None) -> None:
@@ -1107,12 +1205,18 @@ class ToggleSwitch(tk.Frame):
             track = ACCENT_HOVER if self._hover else ACCENT
         else:
             track = SWITCH_OFF_HOVER if self._hover else SWITCH_OFF
-        round_rect(self.canvas, 0, 0, self._cw, h, r=h / 2, fill=track, outline=track)
-        pad = px(2)
-        knob_d = h - pad * 2
-        knob_x = (self._cw - pad - knob_d) if self._value else pad
-        self.canvas.create_oval(knob_x, pad, knob_x + knob_d, pad + knob_d,
-                                fill=KNOB, outline=KNOB)
+        cw, ch, pad = self._cw, self._ch, px(2)
+        knob_d = ch - pad * 2
+        knob_x = (cw - pad - knob_d) if self._value else pad
+
+        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            # 胶囊轨道：r = h/2 恰好是半圆端帽
+            d.rounded_rectangle([0, 0, s(cw), s(h)], radius=s(h / 2.0),
+                                fill=track, outline=track)
+            d.ellipse([s(knob_x), s(pad), s(knob_x + knob_d), s(pad + knob_d)],
+                      fill=KNOB)
+
+        paint_aa(self.canvas, paint, bg=self._bg)
 
     def get(self) -> bool:
         return self._value
@@ -1146,6 +1250,8 @@ class FluentButton(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        # 位图渲染依赖画布实际尺寸：映射前 winfo 是占位值，Configure 后重画一次
+        self.bind("<Configure>", lambda _e: self._redraw())
         self._redraw()
 
     def _palette(self):
@@ -1169,9 +1275,17 @@ class FluentButton(tk.Canvas):
     def _redraw(self) -> None:
         self.delete("all")
         fill, outline, fg = self._palette()
-        round_rect(self, px(0.5), px(0.5), self._cw - px(0.5), self._ch - px(0.5),
-                   r=px(6), fill=fill, outline=outline, width=px(1))
-        self.create_text(self._cw // 2, self._ch // 2, text=self._text, fill=fg,
+        cw, ch = self._cw, self._ch
+
+        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            d.rounded_rectangle([s(px(0.5)), s(px(0.5)),
+                                 s(cw - px(0.5)), s(ch - px(0.5))],
+                                radius=s(px(6)), fill=fill,
+                                outline=outline, width=s(px(1)))
+
+        paint_aa(self, paint, bg=self._bg)
+        # 文字保持原生图元：Tk 的字体渲染本身就是次像素级，比位图缩放更锐
+        self.create_text(cw // 2, ch // 2, text=self._text, fill=fg,
                          font=self._font)
 
     def _on_enter(self, _event=None) -> None:
@@ -1319,6 +1433,7 @@ class TextArea(tk.Frame):
 
 __all__ = [
     "SCALE", "enable_dpi_awareness", "px", "sf", "mix", "round_rect",
+    "AA_SS", "paint_aa",
     "install_ttk_styles", "section", "field_label", "SliderField", "ToggleSwitch",
     "FluentButton", "ColorField", "TextArea", "UI_FAMILY",
 ]
