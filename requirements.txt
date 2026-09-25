@@ -1,0 +1,9 @@
+# 依赖（本机已全部安装，无需 pip install 即可运行）
+# 运行环境：系统 Python（必须含 tkinter；路径随机而异，这里是构建时所用的一台）
+
+Pillow>=10.0      # 图片读写、文字渲染、旋转、alpha 合成
+PyMuPDF>=1.24.3   # PDF 读写与水印层插入（import pymupdf as fitz）
+numpy>=1.24       # 测试中的像素判定
+# tkinter / tkinterdnd2 随 Python 与系统提供：
+#   tkinter      —— 标准库（WorkBuddy 托管 Python 没有，必须用系统 Python）
+#   tkinterdnd2  —— 拖拽支持（已装）

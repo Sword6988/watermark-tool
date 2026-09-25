@@ -1,0 +1,22 @@
+# ---- Build artifacts (large, regenerable) ----
+dist/
+build/
+_obsolete/
+selftest_out/
+# audit scratch (incl. large sample PDFs) — keep _smoke/verify_exe_bytes.py? excluded for a clean repo
+_smoke/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Virtual environments ----
+.venv/
+venv/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---- WorkBuddy project-local data (not source) ----
+.workbuddy/
