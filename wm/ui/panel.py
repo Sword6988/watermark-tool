@@ -29,6 +29,10 @@ from .theme import (ColorField, SliderField, TextArea, field_label, section,
 #: 「四周边距」的说明文案（平铺是唯一模式，语义固定）
 _MARGIN_HINT = "每个水印四周留白"
 
+#: 「旋转角度」圆盘的说明文案：重点是把「盘上那条线 = 文字走向」讲明白，
+#: 否则圆形方向线容易被当成纯装饰；顺带交代 Shift 吸附这个隐藏操作。
+_ANGLE_HINT = "盘上方向线即文字走向；按住 Shift 吸附 15°"
+
 
 class ScrolledFrame(tk.Frame):
     """竖向滚动容器：内容变高时自动扩展。
@@ -193,8 +197,10 @@ class ParamPanel(tk.Frame):
             root, "四周边距", *MARGIN_PCT_RANGE, self._spec.margin_pct, MARGIN_PCT_STEP,
             self._on_margin_pct, unit="%", decimals=0, hint=_MARGIN_HINT)
         self.margin_pct.pack(fill="x")
+        # 角度是**循环量**（0° 与 360° 是同一个方向），线性轨道上它们却分居两端 ——
+        # 用圆盘表示才对；盘上那条贯穿圆心的方向线就是水印文字的真实走向。
         self.angle = SliderField(root, "旋转角度", *ANGLE_RANGE, self._spec.angle, ANGLE_STEP,
-                                 self._on_angle, unit="°")
+                                 self._on_angle, unit="°", dial=True, hint=_ANGLE_HINT)
         self.angle.pack(fill="x", pady=(T.px(T.SP_XXL), 0))
 
         # -- 外观（长什么样） ------------------------------------------------

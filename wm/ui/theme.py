@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable, List, Optional, Tuple
 
 import tkinter as tk
@@ -114,6 +115,22 @@ STEP_IDLE = TEXT_MUTE
 STEP_HOVER = TEXT_DIM
 STEP_ACTIVE = ACCENT
 STEP_OFF = "#c2c5cf"
+
+#: 「旋转角度」圆盘（Canvas 自绘，循环量用圆环表示）。
+#: 参考图是**红圈**，但本工程红（``DANGER``）专指「非法输入」，常驻的红色圆环
+#: 会被读成报错；且色板铁律要求「类型/状态两套色绝不共用」。故默认跟主题走。
+#: 想换成参考图那种红：把 ``DIAL_RING`` / ``DIAL_ARROW`` / ``DIAL_KNOB_EDGE``
+#: 一起改成 ``DIAL_REF_RED`` 即可（仅此三行）。
+DIAL_REF_RED = "#ff5b5a"        # 参考图配色（备选，未启用）
+DIAL_RING = ACCENT              # 轨道圆环
+DIAL_RING_OFF = "#c9ccd4"       # 禁用态圆环
+DIAL_RING_W = 3                 # 圆环粗细（逻辑 px）
+DIAL_LINE = TEXT_DIM            # 方向线（即水印文字走向）
+DIAL_LINE_OFF = "#b8bcc6"       # 禁用态方向线
+DIAL_ARROW = ACCENT             # 方向箭头
+DIAL_ARROW_OFF = "#c2c5cf"      # 禁用态箭头
+DIAL_KNOB_EDGE = ACCENT         # 手柄描边
+DIAL_KNOB_EDGE_OFF = "#c2c5cf"  # 禁用态手柄描边
 SWITCH_OFF_HOVER = "#787b8a"
 FOCUS = "#0f6cbd"
 BADGE_OK = "#0f7b3f"
@@ -412,6 +429,203 @@ class FlatScale(tk.Canvas):
         return states
 
 
+class _AngleDial(tk.Canvas):
+    """「旋转角度」专用圆盘：圆环轨道 + 贯穿圆心的方向线 + 手柄 + 箭头。
+
+    **为什么角度字段不用线性滑块**：角度是**循环量**，没有端点。线性轨道上
+    0° 与 360° 分居两端、视觉上离得最远，实际却是同一个方向；圆盘天然首尾
+    相接，拖过头就是绕回来 —— 形状本身就在表达"这是循环量"。
+
+    **方向线不是装饰**：它贯穿圆心、两端各探出圈外一小段，方向就是水印文字的
+    真实走向（0° 水平向右，逆时针为正，与 ``PIL.Image.rotate`` 的正方向一致）。
+    于是「角度」这个抽象数字变成了一眼就能看懂的方向预览。
+
+    ==========  ==========================================================
+    圆环        轨道，手柄沿它走
+    方向线      贯穿圆心，即当前角度对应的文字走向
+    手柄        白底 + 彩色描边的小圆，落在圆环与方向线的交点上
+    箭头        方向线正方向末端、**手柄外侧**的小三角；它同时打破「直径
+                对称」的歧义 —— θ 与 θ+180° 画出来是同一条线，靠箭头区分
+    ==========  ==========================================================
+
+    交互：拖动手柄转角度；按住 **Shift** 吸附到 15° 的整数倍（对齐平铺角度
+    比一像素 ≈1.8° 的粒度好用）；靠近圆心按下忽略（那里的方向极不稳定，
+    强行取值会跳数）。精细数值仍由数字框 + 步进三角负责。
+
+    公共 API 与 ``FlatScale`` 保持同一最小集（``get`` / ``set`` / ``state``），
+    因此 ``SliderField`` 可以无差别替换 —— 只换绘制与交互，不动上层调用。
+    """
+
+    D = 64              # 圆盘直径（逻辑 px）
+    KNOB = 8            # 手柄半径
+    ARROW_LEN = 8       # 箭头长度
+    ARROW_HALF = 3.5    # 箭头半宽
+    ARROW_GAP = 2       # 箭头与手柄之间的间隙
+    LINE_OVER = 6       # 方向线负方向探出圈外的长度（让它读起来像"轴"而非"射线"）
+    SNAP_DEG = 15.0     # 按住 Shift 时的吸附粒度
+    DEAD_RATIO = 0.45   # 圆心死区（占半径比例）：小于它按下不取值
+
+    def __init__(self, parent, from_: float = 0.0, to: float = 360.0,
+                 command: Optional[Callable[[float], None]] = None,
+                 bg: str = PANEL, **_ignored) -> None:
+        # 圈外余量必须容得下「手柄半径 + 间隙 + 箭头长」：箭头画在手柄**外侧**，
+        # 余量不足就会被后画的手柄盖住（原型第一版正是如此，箭头等于没有）。
+        self._room = px(self.KNOB) + px(self.ARROW_GAP) + px(self.ARROW_LEN) + px(2)
+        side = px(self.D) + self._room * 2
+        super().__init__(parent, width=side, height=side, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2", takefocus=0)
+        self._lo, self._hi = float(from_), float(to)
+        self._cmd = command
+        self._value = self._lo
+        self._hover = False
+        self._press = False
+        self._disabled = False
+        # 不能叫 _w / _h —— 那是 tk.Misc 的保留属性（Tcl 路径名）
+        self._side = float(side)
+
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+
+    # -- 几何 -------------------------------------------------------------
+
+    def _center(self) -> float:
+        return self._side / 2.0
+
+    def _radius(self) -> float:
+        return max(px(6), self._center() - self._room)
+
+    def _unit(self):
+        """当前角度对应的单位方向向量。
+
+        屏幕 y 轴向下，故 ``dy`` 取负 —— 这样角度增大在屏幕上表现为逆时针，
+        与 ``PIL.Image.rotate`` 的正方向一致。
+        """
+        rad = math.radians(self._value)
+        return math.cos(rad), -math.sin(rad)
+
+    def _dist(self, x: float, y: float) -> float:
+        c = self._center()
+        return math.hypot(x - c, y - c)
+
+    def _value_of(self, x: float, y: float) -> float:
+        """屏幕点 -> 角度值（按圆环方向反算，再线性映射到 ``[lo, hi]``）。"""
+        c = self._center()
+        ang = math.degrees(math.atan2(-(y - c), x - c)) % 360.0
+        span = (self._hi - self._lo) or 360.0
+        return self._lo + ang / 360.0 * span
+
+    # -- 交互 -------------------------------------------------------------
+
+    def _on_configure(self, _event=None) -> None:
+        # 取短边：万一被横向拉伸，也保持正圆而不是椭圆
+        self._side = float(max(px(1), min(self.winfo_width(), self.winfo_height())))
+        self._redraw()
+
+    def _on_press(self, event) -> None:
+        if self._disabled:
+            return
+        if self._dist(event.x, event.y) < self._radius() * self.DEAD_RATIO:
+            # 圆心附近：方向对角度的敏感度趋于无穷，点一下值会乱跳 —— 干脆不起拖
+            return
+        self._press = True
+        self._apply(event)
+
+    def _on_drag(self, event) -> None:
+        if self._disabled or not self._press:
+            return
+        self._apply(event)
+
+    def _on_release(self, _event=None) -> None:
+        self._press = False
+        self._redraw()
+
+    def _set_hover(self, on: bool) -> None:
+        self._hover = bool(on)
+        self._redraw()
+
+    def _apply(self, event) -> None:
+        value = self._value_of(event.x, event.y)
+        if event.state & 0x1:          # Shift 掩码
+            value = round(value / self.SNAP_DEG) * self.SNAP_DEG
+        self._value = min(max(value, self._lo), self._hi)
+        self._redraw()
+        if self._cmd is not None:
+            self._cmd(self._value)
+
+    # -- 绘制 -------------------------------------------------------------
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        c = self._center()
+        r = self._radius()
+        ux, uy = self._unit()
+
+        if self._disabled:
+            ring_c, line_c, arrow_c = DIAL_RING_OFF, DIAL_LINE_OFF, DIAL_ARROW_OFF
+            knob_edge, knob_fill = DIAL_KNOB_EDGE_OFF, KNOB_OFF
+        else:
+            ring_c, line_c, arrow_c = DIAL_RING, DIAL_LINE, DIAL_ARROW
+            knob_edge, knob_fill = DIAL_KNOB_EDGE, KNOB
+
+        # 轨道圆环（循环量：一整圈，无端点）
+        self.create_oval(c - r, c - r, c + r, c + r,
+                         outline=ring_c, width=px(DIAL_RING_W))
+
+        # 方向线：贯穿圆心。正方向一直画到**箭头尖端**（中间一段被手柄盖住），
+        # 负方向只探出圈外一小段 —— 与参考图一致：线"穿过"手柄，端头才是箭头。
+        # 若只画到手柄就停、箭头另起一段，箭头会紧贴圆环像根"刺"。
+        base = r + px(self.KNOB) + px(self.ARROW_GAP)
+        tip = base + px(self.ARROW_LEN)
+        over = px(self.LINE_OVER)
+        self.create_line(c - ux * (r + over), c - uy * (r + over),
+                         c + ux * tip, c + uy * tip,
+                         fill=line_c, width=px(2))
+
+        # 箭头：整个落在手柄**外侧**
+        half = px(self.ARROW_HALF)
+        bx, by = c + ux * base, c + uy * base
+        nx, ny = -uy, ux              # 法向（右手系转 90°）
+        self.create_polygon(c + ux * tip, c + uy * tip,
+                            bx + nx * half, by + ny * half,
+                            bx - nx * half, by - ny * half,
+                            fill=arrow_c, outline="")
+
+        # 手柄：白底 + 彩描边，压在圆环与方向线的交点上
+        kr = px(self.KNOB)
+        kx, ky = c + ux * r, c + uy * r
+        if not self._disabled and (self._hover or self._press):
+            # 悬停 / 按下：一圈柔光，强化「这里可以拖」
+            self.create_oval(kx - kr - px(3), ky - kr - px(3),
+                             kx + kr + px(3), ky + kr + px(3),
+                             outline=ACCENT_DIM, width=px(2))
+        shadow = KNOB_OFF if self._disabled else KNOB_SHADOW
+        self.create_oval(kx - kr, ky - kr + px(1), kx + kr, ky + kr + px(1),
+                         fill=shadow, outline=shadow)
+        self.create_oval(kx - kr, ky - kr, kx + kr, ky + kr,
+                         fill=knob_fill, outline=knob_edge, width=px(2))
+
+    # -- 公共 API（与 FlatScale 同构，便于无差别替换） ---------------------
+
+    def get(self) -> float:
+        return self._value
+
+    def set(self, value: float) -> None:
+        """设值并刷新外观；**不**回调 command（与 ttk.Scale 行为一致）。"""
+        self._value = min(max(float(value), self._lo), self._hi)
+        self._redraw()
+
+    def state(self, states=None):
+        if states is None:
+            return ("disabled",) if self._disabled else ()
+        self._disabled = "disabled" in states
+        self._redraw()
+        return states
+
+
 class _Stepper(tk.Canvas):
     """数字框右缘的步进三角（上下两个），**常驻显示**。
 
@@ -552,7 +766,11 @@ class SliderField(tk.Frame):
     def __init__(self, parent, label: str, lo: float, hi: float, value: float,
                  step: float, command: Callable[[float], None], unit: str = "",
                  decimals: int = 0, show_entry: bool = True, hint: Optional[str] = None,
-                 bg: str = PANEL) -> None:
+                 dial: bool = False, bg: str = PANEL) -> None:
+        # ``dial=True``：把线性滑块换成**圆盘**（见 ``_AngleDial``）。只给
+        # 「旋转角度」用 —— 角度是循环量，圆环天然首尾相接；其余三个量是单向
+        # 大小，线性轨道才对。字段的其余部分（标签 / 数字框 / 步进三角 / 校验）
+        # 完全共用，所以这里只是一个绘制策略开关。
         super().__init__(parent, bg=bg)
         self._lo, self._hi, self._step = float(lo), float(hi), float(step)
         self._decimals = int(decimals)
@@ -609,10 +827,17 @@ class SliderField(tk.Frame):
                 widget.bind("<Enter>", self._on_field_enter, add="+")
                 widget.bind("<Leave>", self._on_field_leave, add="+")
 
-        self.scale = FlatScale(self, from_=self._lo, to=self._hi,
-                               command=self._on_scale)
-        self.scale.set(self._value)
-        self.scale.pack(fill="x", pady=(px(SP_SM), 0))
+        if dial:
+            # 圆盘是固定方形，**不能** fill="x"：横向拉满会把圆拉成椭圆
+            self.scale = _AngleDial(self, from_=self._lo, to=self._hi,
+                                    command=self._on_scale, bg=bg)
+            self.scale.set(self._value)
+            self.scale.pack(pady=(px(SP_SM), 0))
+        else:
+            self.scale = FlatScale(self, from_=self._lo, to=self._hi,
+                                   command=self._on_scale)
+            self.scale.set(self._value)
+            self.scale.pack(fill="x", pady=(px(SP_SM), 0))
 
         # 提示行按需显示：没有文案时**不占位**（否则空 Label 会白留一行高度）；
         # 有文案时保留控件本身，便于随模式动态切换（如「四周边距」两种含义）。
