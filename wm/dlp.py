@@ -8,9 +8,11 @@
 
 1. **先探测，再解密** —— 只读取文件头几个字节做魔数比对，非加密文件零额外开销，
    行为与接入前**完全一致**。
-2. **解密器靠配置注入** —— 本模块**不内置、不硬编码**任何第三方解密器，也不实现
-   "进程伪装 / 冒充白名单进程"这类绕过管理员策略的手段。解密器由管理员通过环境
-   变量配置（见 :func:`_build_provider`）。
+2. **不做进程伪装** —— 不改名、不注入、不冒充白名单进程名。内置通道只是让
+   **系统自带的** ``cmd.exe`` / ``powershell.exe`` 去读文件：驱动按进程决定是否
+   返回明文，没授权时读到的仍是密文，会被判为"解密失败"。也就是说能否解密
+   完全由管理员的策略决定，本模块不绕过任何策略。第三方解密器（LDDec）不随
+   源码硬编码，由部署脚本放进程序目录后被自动发现。
 3. **绝不覆盖、不改写原文件** —— 交给解密器的永远是**临时目录里的密文副本**，
    原文件在整个过程中只被只读打开。
 4. **明文只落受控临时目录**，用完立即删除；失败、异常、进程退出都不留残留（
@@ -45,6 +47,12 @@ _VERIFY_READ_LEN = 1024
 
 #: 单个文件的解密超时（秒）。驱动无响应时不能把整个添加过程挂死。
 DEFAULT_TIMEOUT = 30.0
+
+#: ``cmd /c type`` 通道的超时。大 PDF 走 type 是逐字节复制，比普通命令慢。
+CMDTYPE_TIMEOUT = 60.0
+
+#: PowerShell 通道的超时。冷启动就要 1~2 秒，再留足读大文件的余量。
+POWERSHELL_TIMEOUT = 90.0
 
 #: 解析结果状态：未加密 / 已可直接读 / 已解密 / 失败
 STATE_PLAIN = "plain"
@@ -305,6 +313,233 @@ class CommandProvider(DecryptProvider):
                     release(leftover)
 
 
+class TransparentReadProvider(DecryptProvider):
+    """「借系统受信任进程读文件」通道的公共骨架。
+
+    原理（与 price-tool 的 ``lddec_core`` 一致，也是 LDDec 的 WinDec 版所用的）：
+    透明加密驱动按**进程**决定是否返回明文。系统自带的 ``cmd.exe`` /
+    ``powershell.exe`` 常常就在管理员配的信任名单里，于是让它们去读文件，读到的
+    就是明文 —— **不需要任何第三方二进制**。
+
+    这里**没有**任何进程伪装：不改名、不注入、不冒充白名单进程名。能不能读到
+    明文完全取决于管理员的策略；没授权时读到的仍是密文，随后会被
+    :func:`verify_plaintext` 判为"解密失败"。
+
+    两个实现细节不能省：
+
+    * **必须先复制到临时副本再读** —— 用户原文件路径常含中文，而 ``cmd`` 走
+      ANSI，读不到就静默返回空（这也是 :func:`_ascii_temp_root` 存在的原因）；
+    * **副本要保持原扩展名** —— 驱动只对受保护的类型做透明解密，把 ``.pdf``
+      副本改名成 ``.enc`` 之类会被当普通文件、原样吐出密文。
+    """
+
+    name = "read"
+
+    #: 通道标签（给用户看的失败信息用）
+    label = "系统读取"
+
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        self.timeout = float(timeout) if timeout and timeout > 0 else DEFAULT_TIMEOUT
+
+    def available(self) -> bool:
+        raise NotImplementedError
+
+    def _read_plaintext(self, work: str, dst: str) -> None:
+        """把 ``work`` 的明文读到 ``dst``；失败抛 :class:`DecryptError`。"""
+        raise NotImplementedError
+
+    def decrypt(self, src: str, dst: str) -> None:
+        if not self.available():
+            raise DecryptError(f"{self.label}通道在当前系统不可用")
+        if not os.path.isfile(src):
+            raise DecryptError("源文件不存在")
+        ext = os.path.splitext(src)[1]
+        work = os.path.join(plaintext_dir(), "s%s%s" % (uuid.uuid4().hex, ext))
+        try:
+            shutil.copy2(src, work)
+        except OSError as exc:
+            raise DecryptError(f"无法读取源文件（{exc}）") from exc
+        try:
+            self._read_plaintext(work, dst)
+            if not os.path.isfile(dst):
+                raise DecryptError(f"{self.label}没有产生任何输出")
+            if os.path.getsize(dst) <= 0:
+                raise DecryptError(f"{self.label}读到 0 字节（路径可能含非 ASCII 字符）")
+        finally:
+            release(work)
+
+
+class CmdTypeProvider(TransparentReadProvider):
+    """借 ``cmd /c type`` 读明文（LDDec 的 WinDec 版就是这么做的）。
+
+    已实测：现代 Windows 的 ``type`` 对二进制**字节保真**（0x1A 不再被当 EOF），
+    所以图片 / PDF 走这条路不会变形。
+
+    保留 price-tool 的三种调用形式并依次重试：不同调用方式对引号的处理不一致，
+    而失败往往表现为"返回 0 但没产物"，多试一次的成本远低于排查一次。
+    """
+
+    name = "cmd-type"
+    label = "cmd 读取"
+
+    def __init__(self, timeout: float = CMDTYPE_TIMEOUT) -> None:
+        super().__init__(timeout)
+
+    def available(self) -> bool:
+        return os.name == "nt" and bool(_cmd_executable())
+
+    def _read_plaintext(self, work: str, dst: str) -> None:
+        cmd = _cmd_executable()
+        attempts = (
+            [cmd, "/c", "type", work],                 # 独立参数（标准）
+            [cmd, "/c", "type", '"' + work + '"'],     # 手动加引号
+            cmd + " /c type " + '"' + work + '"',      # 整条字符串
+        )
+        problems: List[str] = []
+        for args in attempts:
+            release(dst)
+            try:
+                with open(dst, "wb") as sink:
+                    completed = subprocess.run(
+                        args, stdout=sink, stderr=subprocess.PIPE,
+                        timeout=self.timeout, creationflags=_NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                problems.append("超时")
+                continue
+            except OSError as exc:
+                problems.append(str(exc))
+                continue
+            if completed.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                return
+            problems.append("退出码 %s" % completed.returncode)
+        raise DecryptError("%s失败（%s）" % (self.label, "；".join(problems[-2:]) or "无输出"))
+
+
+class PowershellProvider(TransparentReadProvider):
+    """借 PowerShell 的 ``[IO.File]::ReadAllBytes`` 读明文。
+
+    与 ``type`` 相比：PowerShell 走 Unicode，**不受中文路径影响**，而且是纯字节
+    读写、不经任何文本转换 —— 放在 ``type`` 之后兜底正合适。代价是冷启动比 cmd
+    慢一两秒。
+    """
+
+    name = "powershell"
+    label = "PowerShell 读取"
+
+    def __init__(self, timeout: float = POWERSHELL_TIMEOUT) -> None:
+        super().__init__(timeout)
+
+    def available(self) -> bool:
+        return os.name == "nt" and bool(_powershell_executable())
+
+    def _read_plaintext(self, work: str, dst: str) -> None:
+        # 路径进单引号字符串：只需把单引号本身翻倍；其余字符（含中文、空格、
+        # 方括号、$）在单引号里都是字面量，无需再转义。
+        script = (
+            "$b=[IO.File]::ReadAllBytes('" + work.replace("'", "''") + "');"
+            "$s=[IO.File]::OpenWrite('" + dst.replace("'", "''") + "');"
+            "$s.Write($b,0,$b.Length);$s.Close()"
+        )
+        release(dst)
+        try:
+            completed = subprocess.run(
+                [_powershell_executable(), "-NoProfile", "-NonInteractive",
+                 "-Command", script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=self.timeout, creationflags=_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            raise DecryptError(f"{self.label}超时（超过 {self.timeout:.0f} 秒）")
+        except OSError as exc:
+            raise DecryptError(f"{self.label}调用失败：{exc}")
+        if completed.returncode != 0:
+            detail = _tail(completed.stderr)
+            raise DecryptError(
+                f"{self.label}失败（{detail or '退出码 %s' % completed.returncode}）")
+
+
+class ChainProvider(DecryptProvider):
+    """多通道回退：按优先级依次尝试，**任一通道产出可用明文即成功**。
+
+    为什么需要它：透明加密的环境千差万别 —— 有的机器装了 LDDec、有的只信任
+    cmd、有的只信任 PowerShell。单通道一旦不匹配就整个加不进去；多通道只是把
+    每种可能各试一次，代价仅在于失败时多花几秒。
+
+    每一环都以 :func:`verify_plaintext` 为准（**不是**"命令返回 0"）：返回 0 但
+    读到的仍是密文的情况非常常见，只有内容对了才算成功。
+    """
+
+    name = "chain"
+
+    def __init__(self, providers: List[DecryptProvider]) -> None:
+        self.providers = [p for p in providers if p is not None]
+        self.last_used: Optional[DecryptProvider] = None
+
+    def available(self) -> bool:
+        return any(p.available() for p in self.providers)
+
+    def describe(self) -> str:
+        ready = [p for p in self.providers if p.available()]
+        return "、".join(_channel_label(p) for p in ready) or "无可用通道"
+
+    def decrypt(self, src: str, dst: str) -> None:
+        if not self.providers:
+            raise DecryptError("没有配置任何解密通道")
+        notes: List[str] = []
+        for provider in self.providers:
+            if not provider.available():
+                continue
+            label = _channel_label(provider)
+            try:
+                provider.decrypt(src, dst)
+            except DecryptError as exc:
+                notes.append(f"{label}：{exc}")
+                release(dst)
+                continue
+            error = verify_plaintext(dst)
+            if error is None:
+                self.last_used = provider
+                return
+            notes.append(f"{label}：{error}")
+            release(dst)
+        if not notes:
+            raise DecryptError("没有可用的解密通道")
+        if len(notes) == 1:
+            raise DecryptError(notes[0])
+        # 全列会淹没界面：给总数 + 前两条，足够定位
+        raise DecryptError("已尝试 %d 种方式均失败 —— %s" % (
+            len(notes), "；".join(notes[:2])))
+
+
+def _channel_label(provider: DecryptProvider) -> str:
+    """通道的用户可见名（优先 ``describe()``，LDDec 会带上 exe 名）。"""
+    describe = getattr(provider, "describe", None)
+    if callable(describe):
+        try:
+            return str(describe())
+        except Exception:
+            pass
+    return str(getattr(provider, "label", None) or getattr(provider, "name", provider))
+
+
+def _cmd_executable() -> Optional[str]:
+    """cmd.exe 的绝对路径（优先 ``COMSPEC`` —— 它在任何 Windows 上都有）。"""
+    if os.name != "nt":
+        return None
+    comspec = (os.environ.get("COMSPEC") or "").strip()
+    if comspec and os.path.isfile(comspec):
+        return comspec
+    found = shutil.which("cmd") or shutil.which("cmd.exe")
+    return found if found and os.path.isfile(found) else None
+
+
+def _powershell_executable() -> Optional[str]:
+    """powershell.exe 的绝对路径；没有返回 ``None``（精简版系统可能不带）。"""
+    if os.name != "nt":
+        return None
+    found = shutil.which("powershell") or shutil.which("powershell.exe")
+    return found if found and os.path.isfile(found) else None
+
+
 # ---------------------------------------------------------------------------
 # LDDec（天锐绿盾解密工具）内置适配器
 # ---------------------------------------------------------------------------
@@ -546,15 +781,25 @@ def reset_provider() -> None:
 
 
 def _build_provider() -> Optional[DecryptProvider]:
-    """装配解密器，优先级：显式命令 > **内置 LDDec 自动发现** > 无。
+    """装配解密通道，优先级：显式命令 > **内置回退链** > 无。
 
     * ``WM_DLP_ENABLE``      —— ``0/off/false`` 一键关停全部解密能力。
     * ``WM_DLP_DECRYPT_CMD`` —— 通用命令模板（形如 ``"…dec.exe" "{src}" "{dst}"``），
-      想接别的解密器时用。
-    * **不填也会自动找 LDDec**：只要程序目录（或 ``tools/LDDec/``）下有
-      ``dec.exe``，就用它 —— 这是本项目面向天锐绿盾环境的**内置**通道，零配置。
-    * ``WM_LDDEC_EXE``       —— 显式指定 dec.exe 路径（或其所在目录）。
-    * ``WM_DLP_TIMEOUT``     —— 单文件解密超时秒数（默认 30；LDDec 通道默认 60）。
+      想接别的解密器时用；填了它就**只**用这条，不启用内置链。
+
+    不填时启用内置回退链（与 price-tool 的 ``lddec_core`` 同构），按序尝试：
+
+    1. **LDDec**（程序目录下有 ``dec.exe`` 时）—— 面向天锐绿盾的专用工具；
+    2. **cmd 读取**（``cmd /c type``）—— 系统自带，零部署；
+    3. **PowerShell 读取**（``[IO.File]::ReadAllBytes``）—— 系统自带，不受
+       中文路径影响。
+
+    后两条让工具在**完全没有第三方二进制**的机器上也有机会解出明文（前提是
+    管理员把 cmd.exe / powershell.exe 放进了信任名单）。三者都不可用时返回
+    ``None``，加密文件按"无法解密"处理。
+
+    * ``WM_LDDEC_EXE``   —— 显式指定 dec.exe 路径（或其所在目录）。
+    * ``WM_DLP_TIMEOUT`` —— 单文件解密超时秒数（默认 30；LDDec 通道默认 60）。
     """
     flag = (os.environ.get("WM_DLP_ENABLE") or "1").strip().lower()
     if flag in ("0", "false", "no", "off"):
@@ -567,10 +812,13 @@ def _build_provider() -> Optional[DecryptProvider]:
         except ValueError:
             timeout = DEFAULT_TIMEOUT
         return CommandProvider(template, timeout)
+    chain: List[DecryptProvider] = []
     exe = find_lddec()
     if exe:
-        return LddecProvider(exe)
-    return None
+        chain.append(LddecProvider(exe))
+    chain.append(CmdTypeProvider())
+    chain.append(PowershellProvider())
+    return ChainProvider(chain)
 
 
 # ---------------------------------------------------------------------------
@@ -681,9 +929,15 @@ __all__ = [
     "STATE_DIRECT",
     "STATE_DECRYPTED",
     "STATE_FAILED",
+    "CMDTYPE_TIMEOUT",
+    "POWERSHELL_TIMEOUT",
     "DecryptError",
     "DecryptProvider",
     "CommandProvider",
+    "TransparentReadProvider",
+    "CmdTypeProvider",
+    "PowershellProvider",
+    "ChainProvider",
     "Resolution",
     "magic",
     "is_encrypted",

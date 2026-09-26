@@ -9,7 +9,8 @@
 | 清单项 | 状态 | 说明 |
 |---|---|---|
 | 1 新增 `wm/dlp.py` | ✅ | 魔数探测、解密提供者抽象、临时明文生命周期；`resolve()` / `resolve_all()` |
-| 1b **内置 LDDec 适配器** | ✅ | `LddecProvider` + `find_lddec()` 自动发现：程序目录下有 `dec.exe` 即自动调用，零配置 |
+| 1b **内置 LDDec 适配器** | ✅ | `LddecProvider` + `find_lddec()` 自动发现：程序目录下有 `dec.exe` 即自动调用，零配置；已随包分发 |
+| 1c **多通道回退链** | ✅ | `ChainProvider`：LDDec → `cmd /c type` → PowerShell `ReadAllBytes`，任一产出可用明文即成功（与 `price-tool` 的 `lddec_core` 同构） |
 | 2 `wm/media.py` 的 `read_path` | ✅ | `Document(path, read_path=...)`：`path` 用于输出命名，`read_path` 用于所有读取 |
 | 3 `wm/spec.py` 的 DLP 配置字段 | ➖ | 改为**环境变量**注入（`WM_DLP_DECRYPT_CMD` 等），不把第三方 exe 写进代码 |
 | 4 `wm/ui/app.py` 挂载点 | ✅ | 挂在 `_add_paths`（按钮与拖拽的唯一汇聚点），添加阶段一次性完成 |
@@ -43,10 +44,13 @@
 ## 仍未做的事（按 §2.3 红线）
 
 - 不实现进程伪装 / 冒充白名单进程（那是 LDDec 自带 Faker 的行为，由部署方决定，
-  本工具不复刻、也不改名自身可执行文件）；
-- 不启用"就地覆盖原文件"的解密模式 —— 交给 dec.exe 的永远是临时副本；
-- **不随仓库分发 `dec.exe`**：第三方预编译二进制未经审计，TCP 版还依赖 Qt 运行库。
-  改为提供 `packaging/deploy_lddec.py`，由管理员从贵司已部署/已编译的版本拷贝。
+  本工具不复刻、也不改名自身可执行文件）。系统读取通道只是让**系统自带的**
+  `cmd.exe` / `powershell.exe` 去读文件，是否返回明文完全取决于管理员策略；
+- 不启用"就地覆盖原文件"的解密模式 —— 交给任何通道的永远是临时副本，明文只落
+  受控临时目录（这是与 `price-tool` 的**唯一实质分歧**：它解密后就地替换原文件，
+  本工具经确认后保持"绝不改写原文件"）；
+- `dec.exe` 随包分发（`tools/LDDec/`），来源为贵司 `price-tool` 中已验证可用的
+  cmd 版；仍提供 `packaging/deploy_lddec.py` 以便换成别的版本。
 
 §七 的确认问题依旧有效：若能申请到**信任进程白名单**（路径 A），则整条解密链路
 不会被触发（工具读到的直接是明文），LDDec 也就不必部署。

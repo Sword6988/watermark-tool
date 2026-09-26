@@ -395,7 +395,10 @@ def test_dlp_command_provider_never_touches_the_source():
 
 
 def test_dlp_lddec_is_auto_enabled_when_dec_exe_is_deployed():
-    """内置通道：程序目录下有 dec.exe + config.json 就自动启用，零配置。"""
+    """内置通道：程序目录下有 dec.exe + config.json 就自动启用，零配置。
+
+    dec.exe 在回退链里**排第一**，后面还跟着两条系统读取通道作兜底。
+    """
     previous = dlp.get_provider()
     original_app_dir = dlp.app_dir
     try:
@@ -410,10 +413,13 @@ def test_dlp_lddec_is_auto_enabled_when_dec_exe_is_deployed():
             dlp.app_dir = lambda: tmp
             dlp.reset_provider()
             provider = dlp.get_provider()
-            assert isinstance(provider, dlp.LddecProvider), \
-                "部署了 dec.exe 就必须自动启用 LDDec 通道"
-            assert provider.exe == exe and provider.available()
+            assert isinstance(provider, dlp.ChainProvider), "内置通道是一条回退链"
             assert dlp.find_lddec() == exe
+            channels = provider.providers
+            assert isinstance(channels[0], dlp.LddecProvider), \
+                "部署了 dec.exe 就必须自动启用 LDDec 通道，且排在第一"
+            assert channels[0].exe == exe and channels[0].available()
+            assert "dec.exe" in provider.describe(), "状态栏要能看出启用了 LDDec"
     finally:
         dlp.app_dir = original_app_dir
         dlp.reset_provider()
@@ -595,6 +601,109 @@ def test_dlp_lddec_exit_code_minus_one_points_at_config_json_and_port():
     finally:
         dlp.subprocess.run = original_run
         dlp.set_provider(previous)
+
+
+def test_dlp_chain_falls_through_to_the_next_channel():
+    """回退链：前一通道失败就换下一个，**任一通道产出可用明文即成功**。
+
+    真实环境里「dec.exe 在、但没授权」和「没装 dec.exe、只信任 cmd」都很常见，
+    单通道会把这些机器全判死。
+    """
+    order: List[str] = []
+
+    class _Flaky(dlp.DecryptProvider):
+        name = "flaky"
+        label = "第一通道"
+
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        def available(self) -> bool:
+            return True
+
+        def decrypt(self, src, dst) -> None:
+            order.append(self.mode)
+            if self.mode == "still-cipher":
+                with open(dst, "wb") as handle:
+                    handle.write(open(src, "rb").read())  # 原样吐回：仍是密文
+            elif self.mode == "boom":
+                raise dlp.DecryptError("第一通道炸了")
+            else:
+                with open(dst, "wb") as handle:
+                    handle.write(_png_bytes())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+        chain = dlp.ChainProvider([_Flaky("still-cipher"), _Flaky("boom"), _Flaky("ok")])
+        dst = dlp.new_plaintext_path(secret)
+        try:
+            chain.decrypt(secret, dst)
+            assert order == ["still-cipher", "boom", "ok"], "必须按序试到成功为止"
+            with open(dst, "rb") as handle:
+                assert handle.read() == _png_bytes(), "最终明文来自最后成功的通道"
+            assert chain.last_used is not None and chain.last_used.mode == "ok"
+        finally:
+            dlp.release(dst)
+
+
+def test_dlp_chain_reports_every_channel_when_all_fail():
+    """全通道失败：原因要带上「试过几种」和各通道的原因，便于定位。"""
+    class _Dead(dlp.DecryptProvider):
+        name = "dead"
+
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def available(self) -> bool:
+            return True
+
+        def decrypt(self, src, dst) -> None:
+            raise dlp.DecryptError("%s不可用" % self.label)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+        chain = dlp.ChainProvider([_Dead("dec.exe"), _Dead("cmd"), _Dead("PowerShell")])
+        try:
+            chain.decrypt(secret, dlp.new_plaintext_path(secret))
+        except dlp.DecryptError as exc:
+            text = str(exc)
+            assert "3 种方式" in text, text
+            assert "dec.exe不可用" in text and "cmd不可用" in text, text
+        else:
+            raise AssertionError("全通道失败必须报 DecryptError")
+
+
+def test_dlp_system_read_channels_are_builtin_and_copy_safe():
+    """系统读取通道（cmd / PowerShell）不需要任何第三方二进制，且不改写原文件。
+
+    这两条通道在没有 dec.exe 的机器上是**唯一**的机会：驱动若信任 cmd.exe /
+    powershell.exe，它们读到的就是明文。本用例在本机跑真实子进程 —— 没有加密
+    软件时读到的自然是原文，正好验证「字节保真 + 原文件不动」这两件事。
+    """
+    if os.name != "nt":
+        raise unittest.SkipTest("系统读取通道只面向 Windows")
+    providers = [p for p in (dlp.CmdTypeProvider(), dlp.PowershellProvider()) if p.available()]
+    assert providers, "Windows 上至少要有一条系统读取通道可用"
+    for provider in providers:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _png_bytes((36, 24))
+            source = os.path.join(tmp, "源 文件.png")
+            with open(source, "wb") as handle:
+                handle.write(payload)
+            dst = dlp.new_plaintext_path(source)
+            try:
+                provider.decrypt(source, dst)
+                with open(dst, "rb") as handle:
+                    assert handle.read() == payload, \
+                        "%s 必须字节保真" % provider.name
+                with open(source, "rb") as handle:
+                    assert handle.read() == payload, \
+                        "%s 绝不能改写原文件" % provider.name
+            finally:
+                dlp.release(dst)
+            # 通道只在临时目录里留下副本，原文件旁不许有任何产物
+            assert sorted(os.listdir(tmp)) == ["源 文件.png"], \
+                "%s 在原目录留下了多余文件" % provider.name
 
 
 def test_dlp_batch_reads_plaintext_but_names_output_from_source():

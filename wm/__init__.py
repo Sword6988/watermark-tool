@@ -12,6 +12,6 @@
 
 #: 版本号**唯一真源**：打包脚本（``packaging/spec_common.APP_VERSION``）、使用
 #: 说明、发布说明全部从这里读。发版只改这一处。
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 __all__ = ["spec", "fonts", "layout", "render", "media", "dlp"]
