@@ -4,7 +4,7 @@
     * 扫描 ``C:\\Windows\\Fonts`` 与用户字体目录 ``%LOCALAPPDATA%\\Microsoft\\Windows\\Fonts``。
     * 用 ``PIL.ImageFont.truetype(path).getname()`` 读字体家族名，建立
       ``家族名 -> (文件路径, ttc 索引)`` 的映射。
-    * 优先 ``HarmonyOS Sans SC``，回退 微软雅黑 / 宋体 / 黑体。
+    * 优先 微软雅黑，回退 鸿蒙黑体 / 宋体 / 黑体。
 
 所有函数带缓存，首次扫描约 1~2 秒，之后为 O(1)。
 """
@@ -17,11 +17,20 @@ from typing import Dict, List, Optional, Tuple
 
 from PIL import ImageFont
 
-#: 界面与渲染的字体优先列表（HarmonyOS Sans SC 为本机已装字体）
+#: 界面与渲染的字体优先列表。
+#:
+#: **微软雅黑排在最前**：它是 Windows 自带字体，绝大多数机器都有；鸿蒙黑体
+#: （``HarmonyOS Sans SC``）只在少数机器上装了 —— 让它占位首位，只会让绝大多数
+#: 用户落到后位回退，而且下拉框的第一项（最显眼的那一项）在他们那儿根本选不出
+#: 实际字形，等于白占一个位置。故按「装机量」排序，鸿蒙退到微软系之后。
+#:
+#: 另一个实测细节：``msyh.ttc`` 的 index 0 是 ``Microsoft YaHei``、index 1 才是
+#: ``Microsoft YaHei UI``，而本模块每个文件只读 index 0，所以 UI 变体实际上扫不到
+#: —— 它保留在列表第二位只是表达「有就用」的次序，不影响默认结果。
 PREFERRED_FAMILIES: Tuple[str, ...] = (
-    "HarmonyOS Sans SC",
-    "Microsoft YaHei UI",
     "Microsoft YaHei",
+    "Microsoft YaHei UI",
+    "HarmonyOS Sans SC",
     "SimSun",
     "SimHei",
     "Noto Sans SC",
@@ -258,7 +267,11 @@ def display_names(family_list: List[str]) -> List[str]:
 
 
 def default_family() -> str:
-    """返回本机可用的默认字体家族（优先 HarmonyOS Sans SC）。"""
+    """返回本机可用的默认字体家族（微软雅黑优先，鸿蒙只在没装雅黑时才轮到）。
+
+    与 ``wm.spec.DEFAULT_FONT_FAMILY`` 取同一个值（``PREFERRED_FAMILIES[0]``），
+    两边口径必须一致 —— 否则「界面默认」和「渲染默认」会落到不同字体上。
+    """
     mapping = _scan_fonts()
     for fam in PREFERRED_FAMILIES:
         if fam in mapping:

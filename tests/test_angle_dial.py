@@ -14,9 +14,10 @@
    由 ``_smoke/dial_clockwise_probe.py`` 做端到端主轴比对兜底；
 3. **循环量语义**：接缝只出现在 ±180（文字倒置，最少用），跨 0° 必须**连续**
    （旧值域 0–360 把接缝压在 0° 上，拖过就 359->0 横跳，已修）；越界一律钳制；
-4. **吸附 5°**，且**只此一档** —— Shift 15° / Alt 自由两档已按用户要求移除
-   （隐藏按键没人发现，精确值用数字框）；半径 40px 时 1px ≈ 1.43°，自由拖根本
-   停不住想要的整数；圆心死区内**按下与拖动全程**都不取值；
+4. **完全自由 1°** —— 圆盘自身**不吸附**（不再有 5° 一档：想要 37° 就只能拿到
+   35° 这种事不能发生），拖出来的值经字段量化器按步长 1° 取整；修饰键分档
+   （Shift 15° / Alt 自由）同样已按用户要求移除，隐藏按键没人发现；
+   圆心死区内**按下与拖动全程**都不取值；
 5. 禁用态更淡且完全不响应；
 6. ``set()`` **不**回调 command（与 ttk.Scale / FlatScale 行为一致，
    否则 ``SliderField.set`` 里的显式 ``_emit()`` 会变成重复通知）。
@@ -221,7 +222,9 @@ def test_dial_is_cyclic_and_never_escapes_range():
             seen.append(got)
         assert max(abs(v) for v in seen) <= 10.0, f"跨 0° 应停在 0° 附近，实际 {seen!r}"
         steps = [abs(seen[i + 1] - seen[i]) for i in range(len(seen) - 1)]
-        assert max(steps) <= dial.SNAP_DEFAULT, f"跨 0° 不应有跳变，步长 {steps!r}"
+        # 跳变门槛取 5°：采样点本身最远只跨 4°（-8 -> -4），出现更大的步长就说明
+        # 撞上了接缝（旧值域把接缝压在 0°，会看到 359->0 的横跳）。
+        assert max(steps) <= 5.0, f"跨 0° 不应有跳变，步长 {steps!r}"
 
         # 接缝只该在 ±180：180° 与 -175° 是相邻方向，允许在那儿跳一次
         x, y = _pts(dial, 180)
@@ -248,18 +251,20 @@ def test_dial_is_cyclic_and_never_escapes_range():
         root.destroy()
 
 
-def test_dial_snap_and_center_is_dead():
-    """吸附 5°（**唯一一档**，无修饰键）；圆心死区全程不取值。"""
+def test_dial_free_1deg_and_center_is_dead():
+    """**完全自由 1°**（圆盘自身不吸附、也无修饰键档）；圆心死区全程不取值。"""
     root = _root()
     try:
         dial, calls = _make_dial(root)
 
-        # 吸附到 5° 的整数倍（半径 40px 时 1px ≈ 1.43°，自由拖停不住整数）
-        for probe, expect in ((37, 35), (53, 55), (7, 5), (98, 100)):
+        # 圆盘自身**不吸附**：拖到 37° 就该得到 37°，而不是被 5° 粗粒度拽到 35°
+        # （那就是"想要的值拿不到"）。按步长 1° 取整是字段量化器的职责，由
+        # ``test_sliderfield_dial_mode_wires_up_and_keeps_precision`` 单独守。
+        for probe in (37, 53, 7, 98, -123):
             x, y = _pts(dial, probe)
             dial._on_press(_Ev(x, y))
             got = dial.get()
-            assert abs(got - expect) <= 1e-9, f"{probe}° 应吸附到 {expect}，实际 {got!r}"
+            assert abs(got - probe) <= 1e-6, f"{probe}° 应原样取到，实际 {got!r}"
 
         # **修饰键必须无效**（Shift 15° / Alt 自由 1° 两档已按用户要求移除）：
         # 带不带修饰键结果要完全一致，否则就是死灰复燃。
@@ -271,6 +276,7 @@ def test_dial_snap_and_center_is_dead():
             assert dial.get() == plain, f"{name} 不应改变吸附结果：{dial.get()!r} != {plain!r}"
         assert not hasattr(dial, "SNAP_SHIFT"), "SNAP_SHIFT 常量应已移除"
         assert not hasattr(dial, "ALT_MASK"), "ALT_MASK 常量应已移除"
+        assert not hasattr(type(dial), "SNAP_DEFAULT"), "SNAP_DEFAULT（5° 吸附）常量应已移除"
 
         # 圆心死区：按下应完全被忽略（值不变、也不回调）
         c = dial._center()
@@ -352,13 +358,14 @@ def test_sliderfield_dial_mode_wires_up_and_keeps_precision():
         assert font_pct.scale.winfo_width() > font_pct.scale.winfo_height(), \
             "线性滑块应当是扁的"
 
-        # 盘上拖动 -> 默认吸附 5°，再经字段的 _snap 落到整数步长
+        # 盘上拖动 -> 圆盘**不吸附**（42.4° 原样交给字段），只由字段的 _snap
+        # 按步长 1° 取整 —— 「自由 1°」的完整链路就是这两步。
         dial = angle.scale
         dial._on_press(_Ev(*_pts(dial, 42.4)))
         root.update()
         assert calls, "拖动圆盘应触发字段回调"
         assert abs(calls[-1] - round(calls[-1])) < 1e-9, f"应吸附到整数步长：{calls[-1]!r}"
-        assert calls[-1] == 40.0, f"42.4° 默认吸附 5° 应得 40，实际 {calls[-1]!r}"
+        assert calls[-1] == 42.0, f"42.4° 经步长 1° 取整应得 42，实际 {calls[-1]!r}"
 
         # 循环语义：数字框越界取模而非钳制（360 -> 0，350 -> -10）
         angle.var.set("360")

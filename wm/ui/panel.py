@@ -28,6 +28,11 @@ from .theme import (ColorField, SliderField, TextArea, field_label, section,
 
 #: 「四周边距」的说明文案（平铺是唯一模式，语义固定）
 _MARGIN_HINT = "每个水印四周留白"
+#: 「旋转角度」的说明文案：交代圆盘上那条线的含义与正方向。
+#: ⚠️ 文案里**不能**出现「拖动 / 偏移 / 位置调节」字样 —— 平铺是唯一模式，界面
+#: 不得有任何位置调节入口（``test_qa_ui_defaults_and_no_position_entry`` 会扫描
+#: 面板文案）。所以这里只说"盘上方向线即文字走向"，不提怎么操作。
+_ANGLE_HINT = "盘上方向线即文字走向，顺时针为正"
 
 
 class ScrolledFrame(tk.Frame):
@@ -198,7 +203,7 @@ class ParamPanel(tk.Frame):
         # 正方向取**顺时针**（与读时钟同向）：PIL 的 rotate 是逆时针，故
         # wm.layout 渲染时传 rotate(-angle) 补偿，两处是一对、改一个必须改另一个。
         self.angle = SliderField(root, "旋转角度", *ANGLE_RANGE, self._spec.angle, ANGLE_STEP,
-                                 self._on_angle, unit="°", dial=True)
+                                 self._on_angle, unit="°", dial=True, hint=_ANGLE_HINT)
         self.angle.pack(fill="x", pady=(T.px(T.SP_XXL), 0))
 
         # -- 外观（长什么样） ------------------------------------------------
@@ -273,7 +278,7 @@ class ParamPanel(tk.Frame):
         return self._spec.normalized()
 
     def load_families(self) -> None:
-        """从系统发现字体并填入下拉框（优先 HarmonyOS Sans SC）。
+        """从系统发现字体并填入下拉框（微软雅黑优先，鸿蒙排在后面）。
 
         下拉框显示**中文名**（``_labels``），选中项按下标回查英文原名
         （``_families``）用于渲染。

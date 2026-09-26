@@ -29,7 +29,10 @@ except Exception:  # pragma: no cover - Pillow 一定存在，兜底防御
 # ---------------------------------------------------------------------------
 
 DEFAULT_TEXT: str = "机密文件"
-DEFAULT_FONT_FAMILY: str = "HarmonyOS Sans SC"
+#: 默认字体取**微软雅黑**（与 ``wm.fonts.PREFERRED_FAMILIES`` 首位一致）：
+#: 鸿蒙黑体只在少数机器上装了，拿它当默认会让大多数用户走回退，且下拉框首选项
+#: 在他们那儿没有实际字形。改这里请连 ``wm/fonts.py`` 的优先列表一起改。
+DEFAULT_FONT_FAMILY: str = "Microsoft YaHei"
 DEFAULT_SUFFIX: str = "_watermarked"
 #: 多行文本的行距倍数（内部常量，不对外暴露为参数）
 LINE_SPACING: float = 1.15
