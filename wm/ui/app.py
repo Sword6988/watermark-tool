@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image
 
-from .. import media, render
+from .. import media
 from ..spec import WatermarkSpec
 from . import batch, output, preview_job
 from . import theme as T

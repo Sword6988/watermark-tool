@@ -40,7 +40,7 @@ import io
 import math
 import os
 import time
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import pymupdf as fitz  # PyMuPDF（``import fitz`` 自 1.28 起已弃用，将来会 ImportError）
 from PIL import Image

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from typing import Callable, Dict, Generic, Iterator, Optional, Tuple, TypeVar
+from typing import Callable, Generic, Iterator, Optional, Tuple, TypeVar
 
 Key = TypeVar("Key")
 Value = TypeVar("Value")

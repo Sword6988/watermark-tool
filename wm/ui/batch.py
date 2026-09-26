@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import os
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 from .. import media, render
 from ..spec import DEFAULT_SUFFIX, WatermarkSpec
