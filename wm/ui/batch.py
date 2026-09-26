@@ -15,7 +15,7 @@ import os
 from typing import Callable, List, Optional, Tuple
 
 from .. import media, render
-from ..spec import WatermarkSpec
+from ..spec import DEFAULT_SUFFIX, WatermarkSpec
 from . import output
 
 ProgressFn = Callable[[int, int, str, int], None]
@@ -33,6 +33,7 @@ def run_batch(
     on_progress: ProgressFn,
     on_log: LogFn,
     on_done: DoneFn,
+    suffix: str = DEFAULT_SUFFIX,
 ) -> None:
     """逐文件加水印并写出；通过回调上报进度 / 日志 / 完成。
 
@@ -41,6 +42,10 @@ def run_batch(
         ``index``=当前文件下标）；
       * 每个文件处理完后的整体进度（``done=count=1``、``label=""``、``index``=文件下标），
         由调用方据此重建 ``(index + 1) / total`` 的整条进度。
+
+    ``suffix`` 是输出文件名的中缀（默认 ``_watermarked``）。调用方（UI）应当用
+    :func:`wm.spec.safe_suffix` 清理用户输入后再传进来 —— 本函数不做净化，
+    但它也不会改变任何目录：后缀只参与文件名拼接。
     """
     total = len(files)
     succeeded = 0
@@ -51,7 +56,7 @@ def run_batch(
         try:
             doc = media.Document(path)
             try:
-                dst = media.plan_output(path, out_dir)
+                dst = media.plan_output(path, out_dir, suffix=suffix)
                 if doc.kind == media.KIND_PDF:
                     pages = render.render_pdf(
                         path, dst, spec,
@@ -61,9 +66,13 @@ def run_batch(
                     note = f"{pages} 页"
                 else:
                     out = render.render_image(doc.page_image(0), spec)
-                    # exif_bytes 由 media.Document 提供（PDF / 无 EXIF 时为 None）；
-                    # 用 getattr 兼容对方尚未落地的版本，属性缺失就按无 EXIF 存。
-                    output.save_image(out, dst, getattr(doc, "exif_bytes", None))
+                    # 元数据（EXIF / DPI / ICC）由 media.Document 提供，缺失为 None；
+                    # 用 getattr 兼容对方尚未落地的版本，属性缺失就按无该项存。
+                    output.save_image(
+                        out, dst,
+                        exif=getattr(doc, "exif_bytes", None),
+                        dpi=getattr(doc, "dpi", None),
+                        icc_profile=getattr(doc, "icc_profile", None))
                     note = (f"仅首帧（共 {doc.frame_count} 帧）" if doc.frame_count > 1
                             else "图片")
             finally:

@@ -709,3 +709,90 @@ onefile 运行时 `sys._MEIPASS` 就是自解压目录，而 `main.module_root()
 回归：**77/77、0 跳过、0 失败**（改了 4 处旧断言：spec 合法化期望值、圆盘吸附粒度、
 SliderField 值域）；smoke 39/39；真实窗口截图确认圆盘外观与配色零变化。
 新 EXE md5 `e8be6ca0be061022893c4c89f12be663`。
+
+---
+
+## 第二轮审计 —— 修复实施记录（2026-09-26）
+
+用户拍板：**缓存重构成 `SizedLRU`**，前三批全做，第四批（测试子进程化 + CI）先不做。
+下列 14 处改动均已落地并通过全量回归。
+
+### 第一批：稳定性与产物保真（S1 / M1 / M2 / M4 / M6，外带 A2）
+
+| 项 | 改动 | 位置 |
+|---|---|---|
+| S1 | 批处理期间**整块冻结**参数面板（不只是按钮）。面板逐个控件禁用 + `_emit` 在冻结期直接返回 + `_schedule_preview` 见 busy 即不再排队，三重保险 | `app._set_busy` / `panel.set_enabled` / `theme.{ColorField,TextArea}.set_enabled` |
+| M1 | 图片输出保留源图的 **DPI 与 ICC**（原实现只带回 EXIF）。非法密度（`(0,0)`、`(1,1)`）一律丢弃；CMYK 的 ICC 不往 RGB 图上写（那是错误标注） | `media.{dpi,icc_profile,_read_dpi,_read_icc}` / `output.save_image` |
+| M2 | PDF 大页面**自适应光栅倍率**（原固定 2×）。预算 8MP，倍率向下量化到 0.5 档保证缓存命中 | `render.{pdf_render_scale,PDF_SS_MAX_PIXELS}` |
+| M4 | 版本真源统一：`wm.__version__` 是唯一来源，打包侧现读；已升到 **1.0.1** | `wm/__init__.py` / `packaging/spec_common._detect_version` |
+| M6 | 清理 `build/_obsolete`（38 个历史构建目录，**2.5GB**）；`build/pyi*` 增量缓存保留 | — |
+| A2 | 保存异常翻译成中文（`DecompressionBombError` / 路径不可写 / 格式不支持）；元数据写失败**逐个剥离**后重试，不再让整张图导出失败 | `output.{write_image,_friendly_save_error}` |
+
+M2 实测收益：**A0 单页 2.44s / +873KB → 0.59s / +305KB**，A4 及以内仍是 2×（打印
+精度不降）；版式恒按原生坐标系算，倍率只影响光栅，两条契约不受影响。
+
+### 第二批：缓存重构（S2 + M7）
+
+新增 `wm/lru.py`：`SizedLRU` = OrderedDict + RLock + 真 LRU + 字节预算 + `min_keep`。
+
+* **消灭并发 KeyError（S2）**：预览线程与批处理线程同时读写时，旧的
+  `next(iter(d.items()))` + `del` 会取到已被别人删掉的键。现在全部操作在同一把
+  `RLock` 下完成，`get` 与裁剪不可能交错。8 线程 × 3000 次 get/set/trim 压测无异常。
+* **近似 LRU → 真 LRU**：`get` 命中会把它移到队尾。项目里 PDF 图层缓存的键含页面
+  尺寸，扫描件每差 1pt 就是一条，FIFO 会让正在被反复复用的那条被一次性尺寸冲走。
+* **预算可动态求值**：传 lambda，测试与诊断压小 `PDF_LAYER_CACHE_BYTES` 仍然生效。
+* 三处缓存全部接入：`layout._RENDER_CACHE`（字节）、`layout._BLOCK_CACHE`（条数，
+  顺带把「满 512 条全清」换成 LRU）、`render._PDF_LAYER_CACHE`（字节）。
+* **M7 缓存 key 唯一枚举处**：新增 `WatermarkSpec.render_key()` / `block_key()`，
+  layout 与 render 不再各自手写字段列表 —— 漏一个字段的表现是「改了参数却复用旧
+  图层」，属静默的错误输出。
+
+### 第三批：建议项（A1 / A3 / A4 / A6 / M3 / M5 / M7 / M8）
+
+* **A1** `error.log` 超限轮转（512KB × 3 份），每条异常带时间戳；否则反复失败会让
+  日志无限增长、最新原因被埋在文件尾部。
+* **A3** 参数面板「恢复默认」按钮。走 `load_spec` 而非直接赋 `_spec`，避免
+  「界面显示旧值、渲染用新值」的错位。⚠️ 属性名必须叫 `defaults_btn` —— `reset_btn`
+  是历史「重置居中」的名字，被 QA 的位置调节护栏列为禁止项。
+* **A4** 输出后缀可配。用户可填 `_机密` 之类；输入经 `spec.safe_suffix` 过滤掉路径
+  分隔符与非法字符（`../` 会把输出写到别的目录），空输入回退默认。
+* **A6** 滚动容器销毁时按实例计数解绑全局 `<MouseWheel>`（`bind_all` 注册在 Tcl
+  解释器上，窗口销毁不会自动清理，每建一次 App 就叠一层处理器）。
+* **M3** 预览可取消：`render_overlay_layer` / `preview_job.render_preview` 支持
+  `is_cancelled`，过期帧（用户又改了参数 / 翻页）中途就停 —— 最贵的一帧恰恰是那种
+  几百 MB 的超大图。取消与失败用哨兵 `CANCELLED` 区分，不会闪「预览失败」。
+* **M5** `requirements.txt` 补齐 `tkinterdnd2` / `PyInstaller`（构建期）并给出构建机
+  实际版本。
+* **M8** 文档与实测对齐：`fonts.py` 顶部「首次扫描 1~2 秒」→ 实测 **0.19s**；
+  README 里「面板实时显示预计 N 处水印」（功能早已移除）等过时描述纠正，补上后缀
+  可配 / 恢复默认 / 元数据跟随 / PDF 自适应倍率；docstring 覆盖率 **50% → 64%**。
+* A5（多帧只首帧）维持现状并在日志里标注；A8（每页 sleep）本就已在做——两条均
+  无需改动。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 回归 `tests/run_all.py` | **77 / 77**（0 跳过 0 失败） |
+| 步进器冒烟 `smoke_stepper.py` | **39 / 39** |
+| `_smoke/verify_batch1.py`（DPI/ICC、自适应倍率、友好异常、版本） | **28 / 28** |
+| `_smoke/verify_lru.py`（LRU 语义、预算、8 线程并发） | **18 / 18** |
+| `_smoke/verify_batch3.py`（面板冻结、恢复默认、后缀、日志轮转） | **27 / 27** |
+| 圆盘顺时针探针 / 数值探针 | 17 项全过 / PASS |
+| `/Rotate` 方向对照（dir / marker） | 补偿方向正确，红块在左上 |
+
+### 过程中踩的两个坑（都值得记一笔）
+
+1. **给 `ScrolledFrame.__init__` 加 docstring 时，把 `super().__init__(parent, bg=bg)`
+   一并替换没了** —— 症状是 9 个 UI 用例集体报 `'ScrolledFrame' object has no
+   attribute 'tk'`。批量补注释这种「零风险」改动，事后**必须逐个 diff 复核**，不能
+   因为是非功能性改动就跳过。
+2. **预览取消把「渲染失败」也吞成了「已取消」**：最初让 `render_preview` 对两种
+   情况都返回 `None`，于是 `test_preview_requests_are_serialized`（用假路径调 worker）
+   拿不到 error 载荷。改为返回哨兵 `CANCELLED`，「正常作废」与「真的出错」重新分开。
+
+### 第四批（用户决定暂不做）
+
+* **M9** 测试基建子进程化 + `panel` / `fonts` 的覆盖补齐（`panel.py` 至今仍无独立
+  测试文件直接引用，本轮只补了「恢复默认」一条护栏）；
+* **M10** `.github/` CI。

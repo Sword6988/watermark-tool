@@ -7,6 +7,8 @@
     * 「四周边距」只有**一种**语义（每个水印四周留白），文案无需随模式切换；
     * 平铺是唯一且固定的行为，界面不再显示「铺满整页 · 预计 N 处水印」之类的
       交代文案（页面尺寸状态、块数估算及其刷新链路已一并移除）。
+    * 批处理进行中整块面板**冻结**（见 ``set_enabled``）：用户看不到 Disabled 灰掉
+      的控件就不会知道为什么拖不动，这是刻意的可视反馈。
 """
 
 from __future__ import annotations
@@ -23,8 +25,8 @@ from ..spec import (
     WatermarkSpec, opacity_from_pct, opacity_to_pct,
 )
 from . import theme as T
-from .theme import (ColorField, SliderField, TextArea, field_label, section,
-                    style_combobox_popdown)
+from .theme import (ColorField, FluentButton, SliderField, TextArea, field_label,
+                    section, style_combobox_popdown)
 
 #: 「四周边距」的说明文案（平铺是唯一模式，语义固定）
 _MARGIN_HINT = "每个水印四周留白"
@@ -54,9 +56,15 @@ class ScrolledFrame(tk.Frame):
     PX_PER_NOTCH = 56
     #: 事件合并窗口（毫秒）：单帧之内到达的滚轮事件只触发一次滚动重绘
     COALESCE_MS = 16
+    #: 存活的实例数。``bind_all`` 是**进程级**（Tcl 全局）的，销毁时必须等最后一个
+    #: 实例一起走才能解绑，否则会顺手解掉同进程里别的滚动容器的滚轮。
+    _LIVE_COUNT = 0
 
     def __init__(self, parent, bg: str = T.PANEL) -> None:
+        """把 inner Frame 装进 Canvas，形成可滚动容器。"""
         super().__init__(parent, bg=bg)
+        ScrolledFrame._LIVE_COUNT += 1
+        self._wheel_bound = True
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
                                 yscrollincrement=1)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
@@ -73,10 +81,12 @@ class ScrolledFrame(tk.Frame):
         self.canvas.bind_all("<MouseWheel>", self._on_wheel_all)
 
     def _on_inner(self, _event=None) -> None:
+        """内容变高时同步滚动区域（没这个滚动条滚不到底）。"""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self._update_vbar()
 
     def _on_canvas(self, event) -> None:
+        """画布宽度变化：把 inner 窗口拉到同宽（右侧留 10px 避开滚动条）。"""
         # 右侧留 10px 间隔：内容不再贴着滚动条，视觉上更协调
         self.canvas.itemconfigure(self._win, width=max(1, event.width - T.px(10)))
 
@@ -90,6 +100,25 @@ class ScrolledFrame(tk.Frame):
             self.vbar.pack(side="right", fill="y")
         elif not needed and self.vbar.winfo_ismapped():
             self.vbar.pack_forget()
+
+    def destroy(self) -> None:
+        """销毁时**按需**解掉全局滚轮绑定（避免把 Tcl 全局绑定带到下一个窗口）。
+
+        ``bind_all`` 注册在 Tcl 解释器上，窗口销毁**不会**自动清理它。不解绑的话：
+        每建一次 App（测试里一次发几十次）就叠一层 ``<MouseWheel>`` 处理器，前一个
+        窗口的处理器会跟着一起跑 —— 表现为滚轮越用越卡、偶发指向已销毁控件的
+        TclError。所以这里按实例计数，最后一个走人的实例负责解绑。
+        """
+        try:
+            if self._wheel_bound:
+                ScrolledFrame._LIVE_COUNT -= 1
+                self._wheel_bound = False
+                if ScrolledFrame._LIVE_COUNT <= 0:
+                    self.canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            # 解绑失败不该挡住销毁（窗口关不掉比多一条绑定严重得多）
+            pass
+        super().destroy()
 
     # -- 滚轮 --------------------------------------------------------------
 
@@ -127,6 +156,11 @@ class ScrolledFrame(tk.Frame):
             self._wheel_job = self.after(self.COALESCE_MS, self._flush_wheel)
 
     def _flush_wheel(self) -> None:
+        """合并窗口到期：把累积的滚轮增量折算成像素，一次滚到位。
+
+        不足一格的余量**留到下次**（记回 ``_pending_delta``），否则慢速滚动（每次
+        增量 < 1 格）会被反复截断成 0，表现为「轻推滚轮没反应」。
+        """
         self._wheel_job = None
         pending = self._pending_delta
         self._pending_delta = 0.0
@@ -147,9 +181,14 @@ class ParamPanel(tk.Frame):
     """左侧参数面板。"""
 
     def __init__(self, parent, on_change: Callable[[WatermarkSpec], None]) -> None:
+        """参数面板本体。``on_change`` 在**任何**参数变化时被调用（由 App 决定
+        要不要排预览）；冻结期间（批处理中）调用会被 ``_emit`` 吞掉。
+        """
         super().__init__(parent, bg=T.PANEL)
         self._on_change = on_change
         self._spec = WatermarkSpec.default()
+        #: 面板是否可编辑。**批处理期间必须为 False**（见 ``set_enabled``）
+        self._enabled = True
         # ``_families`` 是英文原名（渲染真值），``_labels`` 是逐项对齐的中文显示名
         self._families: List[str] = []
         self._labels: List[str] = []
@@ -158,6 +197,15 @@ class ParamPanel(tk.Frame):
         header.pack(fill="x", padx=T.px(T.PANEL_PAD), pady=(T.px(T.SP_LG), T.px(T.SP_SM)))
         tk.Label(header, text="水印参数", bg=T.PANEL, fg=T.TEXT,
                  font=(T.UI_FAMILY, T.sf(11), "bold"), anchor="w").pack(side="left")
+        # 「恢复默认」：调参数调到乱七八糟时的一键退路。它按 WM 的自身默认值走，
+        # 不带任何自定义纪录 —— 所以放在标题右端，离具体字段远一点，避免误触。
+        #
+        # ⚠️ 属性名**不能**叫 ``reset_btn``：那是历史上「重置居中」（位置调节）按钮
+        # 的名字，``test_qa_ui_defaults_and_no_position_entry`` 用它当护栏，防止位置
+        # 调节入口死灰复燃。两个按钮语义完全不同，名字必须彻底分开。
+        self.defaults_btn = FluentButton(header, "恢复默认", self._on_reset_defaults,
+                                         kind="ghost", width=T.px(76))
+        self.defaults_btn.pack(side="right")
 
         body = ScrolledFrame(self, bg=T.PANEL)
         self._body = body
@@ -223,14 +271,22 @@ class ParamPanel(tk.Frame):
     # ------------------------------------------------------------------
 
     def _emit(self) -> None:
+        """把当前参数变化通知给宿主（App）；冻结期一律吞掉。"""
+        if not self._enabled:
+            # 冻结期（批处理进行中）的任何变更都不算数：既不该改预览参数，也
+            # 不该起预览线程 —— 后者会与批处理争内存（见 App._set_busy）。
+            return
         if self._on_change is not None:
             self._on_change(self.spec())
 
     def _on_text(self, value: str) -> None:
+        """水印文字（多行）。每次改动都先过 ``normalized()``：空的输入在**这里**
+        就被回退成默认文本，不会等到渲染时才出岔子。"""
         self._spec = self._spec.copy(text=value).normalized()
         self._emit()
 
     def _on_font(self, _event=None) -> None:
+        """下拉框选字体：显示的是**中文名**，真值按**下标**回查英文原名。"""
         # 下拉框里放的是中文显示名，真值按**下标**回查英文原名（重名项也 unambiguous）
         index = self.font_combo.current()
         if 0 <= index < len(self._families):
@@ -250,23 +306,38 @@ class ParamPanel(tk.Frame):
         return "break"
 
     def _on_font_pct(self, value: float) -> None:
+        """字号（页面短边百分比）。"""
         self._spec = self._spec.copy(font_pct=value).normalized()
         self._emit()
 
     def _on_margin_pct(self, value: float) -> None:
+        """四周边距（页面短边百分比；平铺唯一语义 = 每个水印四周留白）。"""
         self._spec = self._spec.copy(margin_pct=value).normalized()
         self._emit()
 
     def _on_angle(self, value: float) -> None:
+        """旋转角度（**循环量**）：合法化走 ``wrap_deg`` 取模，不用 clamp。"""
         self._spec = self._spec.copy(angle=value).normalized()
         self._emit()
 
     def _on_color(self, value: str) -> None:
+        """颜色：只能从预设里选，进来先归一化成 ``#rrggbb``。"""
         self._spec = self._spec.copy(color=value).normalized()
         self._emit()
 
     def _on_opacity(self, value: float) -> None:
+        """不透明度：界面给的是**百分比**，内部存 0.05–1.0 的 alpha。"""
         self._spec = self._spec.copy(opacity=opacity_from_pct(value)).normalized()
+        self._emit()
+
+    def _on_reset_defaults(self) -> None:
+        """一键回到出厂参数（含默认字体）。
+
+        ⚠️ 走 :meth:`load_spec` 而不是直接 ``self._spec = default()``：控件里残留的
+        上次取值不会自己变回去，那样做会出现「界面显示旧值、渲染用新值」的错位。
+        ``load_spec`` 最后会用控件的实际取值反向回写 ``_spec``，三者重新对齐。
+        """
+        self.load_spec(WatermarkSpec.default())
         self._emit()
 
     # ------------------------------------------------------------------
@@ -276,6 +347,28 @@ class ParamPanel(tk.Frame):
     def spec(self) -> WatermarkSpec:
         """当前参数（已合法化）。"""
         return self._spec.normalized()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """冻结 / 解冻**全部**参数控件（批处理期间调用，见 :meth:`App._set_busy`）。
+
+        为什么要整块冻住而不只是禁用按钮：拖一次字号滑杆就会起一个预览线程，
+        而预览线程会另起一份全分辨率图像（8000×8000 单帧 +777MB）。它与正在跑的
+        批处理**叠加**而不是排队 —— 大文件下两者同时驻留数 GB，进程会被系统杀掉，
+        且没有任何报错。控件逐个禁用是能让用户「看得见为什么点不动」的唯一办法。
+        """
+        self._enabled = bool(enabled)
+        self.text_area.set_enabled(enabled)
+        try:
+            # 只读下拉框禁用后仍显示当前值；ttk 的 disabled 态自带淡色反馈
+            self.font_combo.configure(state="readonly" if enabled else "disabled")
+        except tk.TclError:
+            pass
+        self.font_pct.set_enabled(enabled)
+        self.margin_pct.set_enabled(enabled)
+        self.angle.set_enabled(enabled)
+        self.color.set_enabled(enabled)
+        self.opacity.set_enabled(enabled)
+        self.defaults_btn.set_enabled(enabled)
 
     def load_families(self) -> None:
         """从系统发现字体并填入下拉框（微软雅黑优先，鸿蒙排在后面）。

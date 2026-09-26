@@ -708,6 +708,22 @@ def test_qa_ui_defaults_and_no_position_entry():
         assert "留白" in panel.margin_pct.hint_label.cget("text"), "边距文案应为平铺语义"
         assert not hasattr(panel, "tile_hint"), "平铺交代文案控件应已移除"
 
+        # -- 「恢复默认」：一键把**参数**拽回出厂值（与位置无关）--
+        # 属性名必须是 ``defaults_btn``：``reset_btn`` 是历史「重置居中」的名字，
+        # 被上面的位置调节护栏列为禁止项，两者混同会让护栏失效。
+        from wm.spec import WatermarkSpec
+        assert hasattr(panel, "defaults_btn"), "缺少「恢复默认」按钮"
+        panel.font_pct.set(20.0, notify=True)
+        panel.opacity.set(80.0, notify=True)
+        assert panel.spec().font_pct != WatermarkSpec.default().font_pct, "前置：参数已被改动"
+        panel._on_reset_defaults()
+        after = panel.spec()
+        assert after == WatermarkSpec.default(), \
+            f"恢复默认没有回到出厂参数：{after}"
+        # 界面也要跟着回到默认值（不能停在「显示旧值、渲染用新值」的错位上）
+        assert panel.font_pct.get() == WatermarkSpec.default().font_pct
+        assert panel.opacity.get() == 30.0
+
         # -- 打开失败仍要显示错误占位 --
         application.files = ["__not_existing__.pdf"]
         application._current_index = -1

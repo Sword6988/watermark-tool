@@ -104,6 +104,26 @@ def wrap_deg(value: Any, default: float = DEFAULT_ANGLE) -> float:
     return 0.0 if ang == 0.0 else ang   # 消掉 -0.0（否则界面会显示「-0」）
 
 
+#: 后缀里**绝不允许**出现的字符：路径分隔符会把输出写到别的目录去（路径穿越），
+#: Windows 文件名非法字符会让保存直接失败，通配符与控制字符同理。
+_UNSAFE_SUFFIX_CHARS = '\\/:*?"<>|\r\n\t'
+
+
+def safe_suffix(value: Any, default: str = DEFAULT_SUFFIX) -> str:
+    """把用户填的「输出后缀」净化成可直接拼进文件名的中缀。
+
+    输出路径是 ``{原文件名}{后缀}{扩展名}``，后缀一旦含 ``/`` 或 ``\\`` 就会把文件
+    写到别的目录（``../`` 更是直接逃出输出目录）—— 这在「绝不覆盖原文件」之外
+    另开一个安全口子，必须在**入参处**堵死，不能指望调用方记得自己清理。
+
+    净化规则：去掉所有危险字符与首尾空白；净化后为空则回退默认后缀。长度不限，
+    由 UI 输入框的宽度天然约束（超长文件名失败时也有中文报错兜底）。
+    """
+    raw = value if isinstance(value, str) else ""
+    cleaned = "".join(ch for ch in raw.strip() if ch not in _UNSAFE_SUFFIX_CHARS).strip()
+    return cleaned or default
+
+
 def to_float(value: Any, default: float = 0.0) -> float:
     """尽力把任意输入转成 float，失败返回 ``default``（不抛异常）。"""
     if value is None:
@@ -197,6 +217,42 @@ class WatermarkSpec:
             color=normalize_color(self.color),
         )
 
+    # -- 缓存指纹 ---------------------------------------------------------
+
+    def block_key(self) -> Tuple[Any, ...]:
+        """单个水印**块位图**的参数指纹（缓存 key 的一部分）。
+
+        只列影响块位图的字段：``font_pct`` / ``margin_pct`` 决定的是「块画多大、
+        排多密」，块本身的像素**不由它们决定**，故不进 key —— 否则改一次边距就要
+        重渲染所有块，缓存命中率白白归零。
+
+        调用方只需再拼上「字号 px」（同一份参数在不同页面尺寸下字号不同）。
+        """
+        return (
+            tuple(self.lines()),
+            self.font_family,
+            round(float(self.angle), 4),
+            round(float(self.opacity), 6),
+            self.color,
+        )
+
+    def render_key(self) -> Tuple[Any, ...]:
+        """整页渲染**结果**的参数指纹（同 dims + 倍率一起构成完整缓存 key）。
+
+        ⚠️ 这是「哪些参数影响像素」的**唯一枚举处**：任何渲染缓存的 key 都必须
+        从这里派生，不得在各模块里手写字段列表 —— 漏一个字段表现为「改了参数却
+        复用旧图层」（静默的错误输出），且极难排查。
+        """
+        return (
+            self.text,
+            self.font_family,
+            round(float(self.font_pct), 4),
+            round(float(self.margin_pct), 4),
+            round(float(self.angle), 4),
+            round(float(self.opacity), 6),
+            self.color,
+        )
+
     # -- 序列化 -----------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
@@ -243,6 +299,7 @@ __all__ = [
     "OPACITY_PCT_STEP",
     "opacity_to_pct",
     "opacity_from_pct",
+    "safe_suffix",
     "clamp",
     "wrap_deg",
     "to_float",

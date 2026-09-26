@@ -27,12 +27,11 @@ from typing import Dict, List, Optional, Tuple
 from PIL import Image, ImageDraw
 
 from . import fonts
+from .lru import SizedLRU
 from .spec import LINE_SPACING, WatermarkSpec
 
 #: 平铺块数硬上限，防极端参数下块数爆炸卡死
 MAX_TILES = 4000
-#: 各类测量缓存上限
-_CACHE_CAP = 512
 
 #: 单个水印块的**旋转后包围盒像素**上限。块尺寸随「文本长度 × 字号」增长，细长块
 #: 经 ``rotate(expand=True)`` 后可能放大几十至上百倍；只看旋转前尺寸会让长文本绕过
@@ -49,10 +48,21 @@ MAX_BLOCK_PIXELS = 165_000_000
 #: 实测 1.2GB），只按**条数**限流（旧做法）会让几十条就吃掉几个 GB —— 改为按字节算。
 _RENDER_CACHE_BYTES = 256 * 1024 * 1024
 
-#: (font_family, px, angle, lines) -> ((bw,bh), (ix0,iy0,ix1,iy1))
-_BLOCK_CACHE: Dict[tuple, Tuple[Tuple[int, int], Tuple[float, float, float, float]]] = {}
+#: ``_BLOCK_CACHE`` 的**条数**预算。值是两个小元组（几十字节），按条数限流即可。
+_CACHE_CAP = 512
+
+#: 两个缓存都用 :class:`wm.lru.SizedLRU`：带互斥锁 + 真 LRU + 字节/条数预算。
+#: 预算以 **lambda** 传入（惰性求值），这样测试与诊断改
+#: ``layout._RENDER_CACHE_BYTES`` 能立刻生效 —— 固化成成员属性会让这类用例失效。
+#:
+#: ⚠️ ``cost`` 用 lambda 转发而不用裸函数名：这两个 cost 函数定义在本文件更靠后的
+#: 位置，直接引用会 ``NameError``，转发则把它们推迟到真正需要计算的时候。
+#: (spec.block_key(), px) -> ((bw,bh), (ix0,iy0,ix1,iy1))
+_BLOCK_CACHE: SizedLRU = SizedLRU(
+    lambda value: 1, lambda: _CACHE_CAP, min_keep=0)
 #: 同上 + (color, opacity) -> 实际 RGBA 块位图
-_RENDER_CACHE: Dict[tuple, Image.Image] = {}
+_RENDER_CACHE: SizedLRU = SizedLRU(
+    lambda value: _bitmap_cost(value), lambda: _RENDER_CACHE_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +162,13 @@ def _draw_text_block(
 
 
 def _render_block_bitmap(spec: WatermarkSpec, size_px: float) -> Image.Image:
-    """取得指定字号下、旋转后的透明 RGBA 水印块（带缓存）。"""
+    """取得指定字号下、旋转后的透明 RGBA 水印块（带缓存）。
+
+    缓存 key 由 :meth:`WatermarkSpec.block_key` 派生 —— 「哪些参数影响块像素」
+    只在 spec 里枚举一次。
+    """
     fs = max(1.0, float(size_px))
-    key = (
-        spec.font_family or "",
-        round(fs, 3),
-        round(float(spec.angle), 3),
-        tuple(spec.lines()),
-        spec.color,
-        round(float(spec.opacity), 4),
-    )
+    key = (spec.block_key(), round(fs, 3))
     cached = _RENDER_CACHE.get(key)
     if cached is not None:
         return cached
@@ -178,10 +185,9 @@ def _render_block_bitmap(spec: WatermarkSpec, size_px: float) -> Image.Image:
         # 必须改另一个（回归用 tests/test_angle_dial.py 的轴向断言守住）。
         bitmap = bitmap.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
-    # 超大块**不进缓存**（否则单条就把预算撑爆、触发反复清仓），普通块按字节预算淘汰
-    if _bitmap_cost(bitmap) <= _RENDER_CACHE_BYTES:
-        _RENDER_CACHE[key] = bitmap
-        _trim_render_cache()
+    # 超大块**不进缓存**（否则单条就把预算撑爆、触发反复清仓），普通块按字节预算
+    # 淘汰 —— 两件事都由 SizedLRU 内部完成，这里只管塞。
+    _RENDER_CACHE.set(key, bitmap)
     return bitmap
 
 
@@ -190,16 +196,9 @@ def _bitmap_cost(bitmap: Image.Image) -> int:
     return bitmap.size[0] * bitmap.size[1] * 4
 
 
-def _trim_render_cache() -> None:
-    """按插入顺序淘汰最旧的块位图，直到总字节落回预算。
-
-    dict 保持插入顺序，``next(iter(...))`` 即最旧的一条 —— 够用的近似 LRU。
-    """
-    total = sum(_bitmap_cost(v) for v in _RENDER_CACHE.values())
-    while total > _RENDER_CACHE_BYTES and _RENDER_CACHE:
-        key, oldest = next(iter(_RENDER_CACHE.items()))
-        total -= _bitmap_cost(oldest)
-        del _RENDER_CACHE[key]
+def trim_render_cache() -> None:
+    """把块位图缓存压回字节预算（诊断 / 测试用；正常路径由 ``set`` 自动裁剪）。"""
+    _RENDER_CACHE.trim()
 
 
 # ---------------------------------------------------------------------------
@@ -215,27 +214,21 @@ def block_geometry(
     抹掉边缘抗锯齿像素，测出的墨迹比实际小。
     """
     fs = max(1.0, float(size_px))
-    key = (
-        "geom",
-        spec.font_family or "",
-        round(fs, 3),
-        round(float(spec.angle), 3),
-        tuple(spec.lines()),
-    )
+    # 注意用**探针（opacity=1.0）的 block_key**，而不是原 spec 的：几何缓存的结果
+    # 与 opacity 无关，若把 opacity 留在 key 里，调一次透明度就要重测一遍包围盒。
+    probe_spec = spec.copy(opacity=1.0)
+    key = ("geom", probe_spec.block_key(), round(fs, 3))
     cached = _BLOCK_CACHE.get(key)
     if cached is not None:
         return cached
 
-    probe = spec.copy(opacity=1.0)
-    bitmap = _render_block_bitmap(probe, fs)
+    bitmap = _render_block_bitmap(probe_spec, fs)
     bbox = bitmap.getchannel("A").getbbox()
     if not bbox or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
         bbox = (0, 0, bitmap.size[0], bitmap.size[1])
     result = (bitmap.size, (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])))
 
-    if len(_BLOCK_CACHE) >= _CACHE_CAP:
-        _BLOCK_CACHE.clear()
-    _BLOCK_CACHE[key] = result
+    _BLOCK_CACHE.set(key, result)
     return result
 
 

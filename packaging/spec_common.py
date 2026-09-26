@@ -15,7 +15,25 @@ SPECDIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SPECDIR)
 
 APP_NAME = "WatermarkTool"
-APP_VERSION = "1.0.0"
+
+
+def _detect_version() -> str:
+    """版本号**单一真源**：读 ``wm.__version__``，读不到才用兜底字面量。
+
+    历史上有两份真源（``wm.__version__`` 与这里的 ``APP_VERSION`` 各写一份），
+    发布时只改一处就会让「程序内版本」与「包名 / 使用说明里的版本」对不上。
+    现在打包侧一律以 ``wm`` 为准；兜底值仅用于 ``wm`` 不可导入的极端场景。
+    """
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    try:
+        from wm import __version__ as _version
+    except Exception:
+        return "1.0.1"
+    return str(_version)
+
+
+APP_VERSION = _detect_version()
 
 # Tcl/Tk >= 9 时 tkdnd 走 *-tcl9 目录
 import tkinter  # noqa: E402  (延迟到使用处也行，这里直接用)

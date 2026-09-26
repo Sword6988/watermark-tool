@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 import time
 from typing import Callable, Dict, Optional, Tuple
@@ -45,6 +46,7 @@ import pymupdf as fitz  # PyMuPDF（``import fitz`` 自 1.28 起已弃用，将�
 from PIL import Image
 
 from . import layout
+from .lru import SizedLRU
 from .spec import WatermarkSpec
 
 #: **图片**路径的**小图**光栅倍率（超采样后降采样回原尺寸，边缘更平滑）。
@@ -67,7 +69,19 @@ IMAGE_BAND_PIXELS = 16_000_000
 #: 每条带的行数；峰值内存 ≈ 带宽 × 宽 × 4 字节。
 IMAGE_BAND_ROWS = 1024
 #: **PDF** 路径的光栅倍率（72 dpi * 2 = 144 dpi）。打印需要更高分辨率，保留 2×。
+#:
+#: ⚠️ 这个 2× 是**上限**，不是固定值：大页面会按 :data:`PDF_SS_MAX_PIXELS` 自动
+#: 降倍率（见 :func:`pdf_render_scale`）—— 实测 A0 单页固定 2× 要 2.44s、PDF 体积
+#: +873KB，而 A4 只要 +47KB，把 A0 的倍率降到 1× 后两者都回到 A4 量级。
 PDF_RENDER_SCALE = 2.0
+#: PDF 图层的**像素预算**：单个 2× 图层超过它就降倍率。取 8MP 与图片路径的
+#: :data:`IMAGE_SS_MAX_PIXELS` 对齐（A4 2× 约 2MP 不受影响；A0 2× 约 32MP 降到 1×）。
+PDF_SS_MAX_PIXELS = 8_000_000
+#: PDF 光栅倍率下限。低于 1× 就是「比 72dpi 还粗」，打印会明显发虚，不再往下探。
+PDF_MIN_RENDER_SCALE = 1.0
+#: 倍率量化步长：相邻尺寸（扫描件常见的 1pt 抖动）必须落到**同一个**倍率上，
+#: 否则缓存每条尺寸一套、命中率归零。0.5 一档足够，也更稳。
+PDF_SCALE_QUANTUM = 0.5
 
 #: PDF 图层缓存（``fitz.Pixmap``）的**字节**预算。
 #:
@@ -85,6 +99,31 @@ PDF_LAYER_CACHE_BYTES = 256 * 1024 * 1024
 
 ProgressFn = Callable[[int, int, str], None]
 CancelFn = Callable[[], bool]
+
+
+def pdf_render_scale(page_w: float, page_h: float, scale: float = PDF_RENDER_SCALE) -> float:
+    """按页面尺寸把 PDF 光栅倍率压到像素预算内（**版式不变，只降光栅密度**）。
+
+    能这么做的前提与图片路径那条一样：版式恒在原生 1:1 页面坐标系里算（块数 /
+    间距 / 贴边都不随倍率变），倍率只影响块位图的光栅密度 —— 所以降倍率不会破坏
+    「图片 = PDF」「预览 = 输出」两条契约，代价只是水印字的边缘略柔。
+
+    倍率**向下量化**到 :data:`PDF_SCALE_QUANTUM`：相邻尺寸（扫描件常差 1pt）落到
+    同一档，缓存才不会每页一条。
+
+        A4 595×842（0.5MP）-> 2.0（不变，打印精度优先）
+        A1 1684×2384（4.0MP）-> 1.0
+        A0 3370×2384（8.0MP）-> 1.0（旧行为固定 2.0，实测 2.44s / +873KB）
+    """
+    base = max(PDF_MIN_RENDER_SCALE, float(scale))
+    area = float(page_w) * float(page_h)
+    if area <= 0:
+        return base
+    affordable = math.sqrt(PDF_SS_MAX_PIXELS / area)
+    if affordable >= base:
+        return base
+    steps = int(math.floor(affordable / PDF_SCALE_QUANTUM))
+    return max(PDF_MIN_RENDER_SCALE, steps * PDF_SCALE_QUANTUM)
 
 
 class Cancelled(Exception):
@@ -250,7 +289,8 @@ def _composite_banded(
 
 
 def render_overlay_layer(
-    page_w: float, page_h: float, spec: WatermarkSpec, scale: float = 1.0
+    page_w: float, page_h: float, spec: WatermarkSpec, scale: float = 1.0,
+    is_cancelled: Optional[CancelFn] = None,
 ) -> Image.Image:
     """预览 / 通用入口：**整层按 1:1 渲染后整体缩放到 ``page*scale``**。
 
@@ -258,6 +298,9 @@ def render_overlay_layer(
     （WYSIWYG）。若改为按缩放后字号直接光栅化块，短边小 / 缩放比极端时字形密度
     会偏移（墨迹覆盖率偏差可达约 4–6pp）。输出路径用 :func:`render_output_layer`
     以保持清晰。``scale == 1`` 时与输出层逐像素一致。
+
+    ``is_cancelled``：可选的取消回调（预览用）。与输出路径同源、同一套语义 ——
+    一旦返回 True 立刻抛 :class:`Cancelled`，调用方负责把它翻译成「这一帧作废」。
     """
     page_w = float(page_w)
     page_h = float(page_h)
@@ -267,7 +310,7 @@ def render_overlay_layer(
     if page_w <= 0 or page_h <= 0:
         return Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
 
-    native = _render_crisp_layer(page_w, page_h, spec, 1.0)
+    native = _render_crisp_layer(page_w, page_h, spec, 1.0, is_cancelled=is_cancelled)
     if native.size == (layer_w, layer_h):
         return native
     return native.resize((layer_w, layer_h), Image.LANCZOS)
@@ -370,20 +413,19 @@ def flatten(img: Image.Image, background: Tuple[int, int, int] = (255, 255, 255)
 #:
 #: 页面尺寸仍取整到 pt：500.0 与 500.4 会共键，可能有最高约 23/255 的亚像素灰度差；
 #: 这是用肉眼不可见的误差换取扫描件尺寸抖动时缓存命中率的已知取舍。
-_PDF_LAYER_CACHE: Dict[tuple, fitz.Pixmap] = {}
+#:
+#: 容器用 :class:`wm.lru.SizedLRU`：预览线程与批处理线程会**同时**读写它，无锁的
+#: trim 会随机 ``KeyError``（审计 S2）。预算同样走 lambda 惰性求值，方便测试压小。
+_PDF_LAYER_CACHE: SizedLRU = SizedLRU(
+    lambda value: _pixmap_cost(value), lambda: PDF_LAYER_CACHE_BYTES)
 
 
 def _spec_cache_key(spec: WatermarkSpec) -> tuple:
-    """图层缓存用的「参数指纹」：影响图层像素的每个字段都得进来。"""
-    return (
-        spec.text,
-        spec.font_family,
-        round(float(spec.font_pct), 4),
-        round(float(spec.margin_pct), 4),
-        round(float(spec.angle), 4),
-        round(float(spec.opacity), 6),
-        spec.color,
-    )
+    """图层缓存用的「参数指纹」—— 真源是 :meth:`WatermarkSpec.render_key`。
+
+    留这个薄封装只为兼容既有调用点：**不要**在这里补字段，改 spec 去。
+    """
+    return spec.render_key()
 
 
 def _pixmap_cost(pix: "fitz.Pixmap") -> int:
@@ -400,27 +442,18 @@ def _pixmap_cost(pix: "fitz.Pixmap") -> int:
     return int(getattr(pix, "n", 4) or 4) * int(pix.width) * int(pix.height)
 
 
-def _trim_pdf_layer_cache() -> None:
-    """按插入顺序淘汰最旧的图层 Pixmap，直到总字节落回 :data:`PDF_LAYER_CACHE_BYTES`。
-
-    dict 保持插入顺序，``next(iter(...))`` 即最旧的一条 —— 与
-    :func:`wm.layout._trim_render_cache` 同一套近似 LRU（预算读的是模块全局，
-    测试可以直接改 ``render.PDF_LAYER_CACHE_BYTES`` 来压小预算）。
-
-    ⚠️ **最后一条永不淘汰**：``render_pdf`` 是「先入缓存、再 ``insert_image``」，
-    正在用的那张就是最新一条，裁剪只会淘汰比它更旧的（``insert_image`` 是同步的），
-    因此它天然安全；这里再显式保留至少一条作为兜底。
-    """
-    total = sum(_pixmap_cost(value) for value in _PDF_LAYER_CACHE.values())
-    while total > PDF_LAYER_CACHE_BYTES and len(_PDF_LAYER_CACHE) > 1:
-        key, oldest = next(iter(_PDF_LAYER_CACHE.items()))
-        total -= _pixmap_cost(oldest)
-        del _PDF_LAYER_CACHE[key]
-
-
 def clear_pdf_layer_cache() -> None:
     """清空 PDF 图层缓存（测试 / 诊断用）。"""
     _PDF_LAYER_CACHE.clear()
+
+
+def trim_pdf_layer_cache() -> None:
+    """把图层缓存压回字节预算（诊断用；正常路径由 ``SizedLRU.set`` 自动裁剪）。
+
+    ⚠️ **最新一条永不淘汰**：``render_pdf`` 是「先入缓存、再 ``insert_image``」，
+    正在用的那张就是最新一条。``SizedLRU`` 的 ``min_keep=1`` 兜住这条底线。
+    """
+    _PDF_LAYER_CACHE.trim()
 
 
 def _discard_part(part_path: str) -> None:
@@ -448,6 +481,9 @@ def render_pdf(
     每页插入同一张（按页面尺寸缓存）的透明水印层；循环里 ``time.sleep(0.001)``
     主动让出 GIL —— Windows 上 ``sleep(0)`` 只让出微秒级，主线程 UI 会假死。
 
+    ``scale`` 是**上限**：每页再经 :func:`pdf_render_scale` 按像素预算下调
+    （A4 仍是 2×，A0 降到 1×），见 :data:`PDF_SS_MAX_PIXELS`。
+
     输出走「先写 ``dst + ".part"``、再 ``os.replace``」：同目录内 ``os.replace``
     是原子的，因此既保留「绝不留半成品」的语义，又不必像旧实现 ``doc.tobytes()``
     那样把整份输出 PDF 驻留内存 —— 实测 30 页 / 输出 86MB 的样本：峰值工作集增量
@@ -465,12 +501,14 @@ def render_pdf(
             page = doc[index]
             rect = page.rect               # 视觉尺寸（**已应用** /Rotate）
             rot = int(page.rotation) % 360
-            key = (spec_key, float(scale), int(round(rect.width)),
+            # 大页面自动降倍率（A0 2× -> 1×，实测 2.44s -> 约 1/4），版式不受影响
+            eff_scale = pdf_render_scale(rect.width, rect.height, scale)
+            key = (spec_key, float(eff_scale), int(round(rect.width)),
                    int(round(rect.height)), rot)
             pix = _PDF_LAYER_CACHE.get(key)
             if pix is None:
                 # 输出用清晰层（缩放坐标系内渲染），块位图按放大字号光栅化
-                layer = render_output_layer(rect.width, rect.height, spec, scale=scale)
+                layer = render_output_layer(rect.width, rect.height, spec, scale=eff_scale)
                 if rot:
                     # ⚠️ **/Rotate 页必须补偿**：``page.rect`` 是已旋转的**视觉**
                     # 尺寸（595×842 的页 + /Rotate 90 => 842×595），而 ``insert_image``
@@ -490,10 +528,9 @@ def render_pdf(
                 buffer = io.BytesIO()
                 layer.save(buffer, format="PNG")
                 pix = fitz.Pixmap(buffer.getvalue())  # n=4, alpha=1（保留 alpha）
-                # 单条就超预算的不入缓存（否则一进去就把缓存清光，反复重渲染）
-                if _pixmap_cost(pix) <= PDF_LAYER_CACHE_BYTES:
-                    _PDF_LAYER_CACHE[key] = pix
-                    _trim_pdf_layer_cache()
+                # 单条超预算时 SizedLRU 自动拒收（否则一进去就把缓存清光，
+                # 反复重渲染）；普通过则由它按字节预算淘汰最旧的一条。
+                _PDF_LAYER_CACHE.set(key, pix)
             if rot:
                 page.set_rotation(0)       # 插到未旋转坐标系；插完立刻还原
             try:
@@ -525,6 +562,10 @@ __all__ = [
     "IMAGE_BAND_PIXELS",
     "IMAGE_BAND_ROWS",
     "PDF_RENDER_SCALE",
+    "PDF_SS_MAX_PIXELS",
+    "PDF_MIN_RENDER_SCALE",
+    "PDF_SCALE_QUANTUM",
+    "pdf_render_scale",
     "PDF_LAYER_CACHE_BYTES",
     "clear_pdf_layer_cache",
     "Cancelled",

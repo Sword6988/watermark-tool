@@ -17,15 +17,44 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 
 APP_NAME = "WatermarkTool"
 FROZEN = bool(getattr(sys, "frozen", False))
+#: 单个错误日志的字节上限，超过就轮转（runtime.log 每次启动重写，不受此限）
+ERROR_LOG_MAX_BYTES = 512 * 1024
+#: 保留的历史错误日志份数（``error.log.1`` … ``error.log.N``）
+ERROR_LOG_BACKUPS = 3
 
 
 # ---------------------------------------------------------------------------
 # 冻结环境基础设施
 # ---------------------------------------------------------------------------
+
+def rotate_log(path: str, limit: int = ERROR_LOG_MAX_BYTES,
+               backups: int = ERROR_LOG_BACKUPS) -> None:
+    """``error.log`` 超限即轮转：``.log -> .log.1 -> .log.2 …``，最多留 ``backups`` 份。
+
+    为什么必须轮转：每异常写数百到数千字节，而卡在同一个启动错误上时用户会反复
+    双击 —— 日志**只增不减**，几个月后单个文件就能长到几十 MB，且「最新的原因」
+    被埋在文件尾部，排查时反而更难找。轮转后 error.log 恒为最新一次。
+
+    任何一步失败都吞掉：日志轮转不是主流程，绝不能为了整理日志把程序搞崩。
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= limit:
+            return
+        oldest = "%s.%d" % (path, backups)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for index in range(backups - 1, 0, -1):
+            source = "%s.%d" % (path, index)
+            if os.path.exists(source):
+                os.replace(source, "%s.%d" % (path, index + 1))
+        os.replace(path, "%s.1" % path)
+    except OSError:
+        pass
 
 def user_log_dir() -> str:
     """可写日志目录：``%LOCALAPPDATA%\\WatermarkTool\\logs``（绝不写程序目录）。"""
@@ -296,7 +325,9 @@ def main(argv: list) -> int:
         err = os.path.join(user_log_dir(), "error.log")
         tb = traceback.format_exc()
         try:
+            rotate_log(err)  # 先轮转：否则反复失败会让 error.log 无限增长
             with open(err, "a", encoding="utf-8") as f:
+                f.write("==== %s ====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
                 f.write(tb + "\n")
         except OSError:
             pass

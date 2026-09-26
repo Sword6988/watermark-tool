@@ -51,10 +51,59 @@ def is_supported(path: str) -> bool:
 # 文档封装
 # ---------------------------------------------------------------------------
 
+#: 输出编码器支持接收 ``dpi`` 参数的格式。BMP / GIF 没有分辨率容器，显式不传，
+#: 否则 Pillow 会抛 ``ValueError: unknown file extension`` 之外的参数错误。
+DPI_SAVE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"})
+#: 输出编码器支持内嵌 ICC 色彩配置文件的格式（同 ``ui.output.ICC_SAVE_EXTS`` 的真源）。
+ICC_SAVE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"})
+#: 源图的哪些色彩模式可以**原样**把 ICC 带到 RGB 输出上。CMYK / YCbCr 的 ICC 描述
+#: 的是四通道色彩空间，把它的 profile 塞进已被转成 RGB 的图里是**错误标注**，
+#: 宁可不写也不能写错。
+ICC_SAFE_MODES = frozenset({"RGB", "RGBA", "L", "LA", "P"})
+
+
+def _read_dpi(raw: object) -> Optional[Tuple[int, int]]:
+    """把 ``info["dpi"]`` 规范化成 ``(x, y)`` 整数对，不可用返回 ``None``。
+
+    Pillow 给的是浮点（JPEG 的 JFIF 密度、PNG 的 pHYs 都可能是 ``(300.0, 300.0)``
+    之类）。**必须**过滤两类值：非正数（``(0, 0)``）与荒谬小值（``(1, 1)``）——
+    后者写进输出会让打印尺寸夸张到几十米，比不写更糟。下界取 8 dpi：正常素材的
+    密度都在 72 以上，低于这个数的不是真实分辨率。
+    """
+    if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+        return None
+    try:
+        x, y = int(round(float(raw[0]))), int(round(float(raw[1])))
+    except (TypeError, ValueError):
+        return None
+    if min(x, y) < 8 or max(x, y) > 100_000:
+        return None
+    return (x, y)
+
+
+def _read_icc(raw: object) -> Optional[bytes]:
+    """把 ``info["icc_profile"]`` 规范化成 ``bytes``，为空 / 类型不对返回 ``None``。"""
+    if isinstance(raw, bytes) and raw:
+        return raw
+    if isinstance(raw, (bytearray, memoryview)) and len(raw):
+        return bytes(raw)
+    return None
+
+
 class Document:
     """一个待处理的文件（图片或 PDF）。
 
     图片的「页面坐标系」= 像素；PDF 的「页面坐标系」= 点（pt）。
+
+    除像素外还保留三类**应带回输出文件**的元数据（PDF / 缺失时为 ``None``）：
+
+        * ``exif_bytes``  —— 转正后的 EXIF；
+        * ``dpi``         —— 源图分辨率（打印尺寸靠它，丢了会让 300dpi 的扫描件
+                             输出后变成 72dpi，打印尺寸放大 4 倍）；
+        * ``icc_profile`` —— 源图 ICC 色彩配置（丢了会偏色）。
+
+    三者都只在**头部解析阶段**读取（``Image.open`` 后 ``info`` 字典已有，不会
+    解码整张图），因此不影响「打开大图不额外驻留像素」的性能约束。
     """
 
     def __init__(self, path: str) -> None:
@@ -67,6 +116,10 @@ class Document:
         self._pdf: Optional[fitz.Document] = None
         # 输出侧可直接写回的、与已转正像素一致的 EXIF；PDF/无 EXIF 图片为 None。
         self.exif_bytes: Optional[bytes] = None
+        #: 源图分辨率 ``(x, y)``；无分辨率信息 / PDF 为 None
+        self.dpi: Optional[Tuple[int, int]] = None
+        #: 源图 ICC 色彩配置；PDF / 无 ICC / 色彩空间不可直传时为 None
+        self.icc_profile: Optional[bytes] = None
         if self.kind == KIND_IMAGE:
             source_image = Image.open(self.path)
             try:
@@ -80,6 +133,9 @@ class Document:
                 # 等 page_image() 真正需要像素时再短暂打开。
                 self.frame_count = int(getattr(source_image, "n_frames", 1) or 1)
                 source_image.seek(0)
+                self.dpi = _read_dpi(source_image.info.get("dpi"))
+                self.icc_profile = (_read_icc(source_image.info.get("icc_profile"))
+                                    if source_image.mode in ICC_SAFE_MODES else None)
                 # 不调用 source_image.getexif()：Pillow 的 PNG 实现会为此 load() 整张
                 # 图片。JPEG / PNG / WebP 在 open 阶段已把原始 EXIF 块放进 info，直接
                 # 解析这段小字节串即可读取 Orientation，而无需创建像素缓冲。
@@ -191,6 +247,9 @@ __all__ = [
     "SUPPORTED_EXTS",
     "KIND_IMAGE",
     "KIND_PDF",
+    "DPI_SAVE_EXTS",
+    "ICC_SAVE_EXTS",
+    "ICC_SAFE_MODES",
     "ext_of",
     "kind_of",
     "is_supported",

@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from PIL import Image
 
 from .. import media, render
-from ..spec import WatermarkSpec
+from ..spec import DEFAULT_SUFFIX, WatermarkSpec, safe_suffix
 from . import batch, output, preview_job
 from . import theme as T
 from .panel import ParamPanel
@@ -52,6 +52,10 @@ class App:
     _EXIF_SAVE_EXTS = output.EXIF_SAVE_EXTS
 
     def __init__(self, root: tk.Misc) -> None:
+        """装配主窗口。所有跨线程的入口（队列 / after 轮询）都在这里建好。
+
+        ⚠️ 这里**不**进入 ``mainloop`` —— GUI 与测试都要能在返回后自己控制循环。
+        """
         self.root = root
         self.files: List[str] = []
         self.doc: Optional[media.Document] = None
@@ -94,6 +98,11 @@ class App:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        """左（文件 + 参数）/ 右（预览）/ 下（进展与执行）三段的静态骨架。
+
+        只负责「摆控件」，不读任何业务数据：保持这里幂等且无副作用，UI 用例才能
+        在没有真实文件的情况下把窗口建起来。
+        """
         root = self.root
         root.title(TITLE)
         root.geometry("1120x740")
@@ -163,6 +172,23 @@ class App:
         self.out_reset_btn = FluentButton(out_row, "恢复同目录", self._reset_out_dir,
                                           kind="ghost", width=T.px(84))
         self.out_reset_btn.pack(side="right", padx=(0, T.px(T.SP_XS)))
+
+        # 输出后缀：让用户自定义批次标记（如 ``_机密``），默认 ``_watermarked``。
+        # 取值一律经 :func:`wm.spec.safe_suffix` 净化 —— 后缀里一旦含路径分隔符，
+        # 输出就会被写到别的目录（``../`` 更会逃出输出目录）。
+        suffix_row = tk.Frame(files_card, bg=T.PANEL)
+        suffix_row.pack(fill="x", pady=(0, T.px(T.SP_MD)))
+        tk.Label(suffix_row, text="输出后缀（文件名追加的部分）", bg=T.PANEL,
+                 fg=T.TEXT_FAINT, font=(T.UI_FAMILY, T.sf(9))).pack(side="left")
+        self.suffix_var = tk.StringVar(value=DEFAULT_SUFFIX)
+        self.suffix_entry = tk.Entry(
+            suffix_row, textvariable=self.suffix_var, width=14, justify="right",
+            bg=T.CONTROL, fg=T.TEXT, relief="flat", bd=0, insertwidth=T.px(1),
+            highlightthickness=T.px(1), highlightbackground=T.FIELD_LINE,
+            highlightcolor=T.ACCENT, font=(T.UI_FAMILY, T.sf(10)))
+        self.suffix_entry.pack(side="right")
+        self.suffix_entry.bind("<Return>", self._on_suffix_commit)
+        self.suffix_entry.bind("<FocusOut>", self._on_suffix_commit)
 
         # -- 参数面板 ------------------------------------------------------
         self.panel = ParamPanel(left, on_change=self._on_spec_change)
@@ -314,6 +340,7 @@ class App:
     # ------------------------------------------------------------------
 
     def _on_drop(self, event) -> None:
+        """拖拽投放：``tkinterdnd2`` 给的是 Tcl 列表串（含空格的路径要用花括号包）。"""
         if self._list_locked():
             return "break"
         try:
@@ -330,6 +357,7 @@ class App:
         self._add_paths(list(paths))
 
     def _choose_files(self) -> None:
+        """「选择文件」按钮 / 预览区空态的共用入口（多选）。"""
         paths = filedialog.askopenfilenames(
             title="选择图片或 PDF",
             filetypes=[("图片 / PDF", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif *.pdf"),
@@ -338,6 +366,11 @@ class App:
             self._add_paths(list(paths))
 
     def _add_paths(self, paths: List[str]) -> None:
+        """把一批路径并入列表：目录**递归第一层**、文件按类型过滤、全局去重。
+
+        目录只展开一层：用户拖进来一个大型素材库时，递归遍历的子目录往往包含
+        上万张缩略图，与其把界面卡死，不如让他再拖一次。
+        """
         if self._list_locked():
             return
         added: List[str] = []
@@ -387,6 +420,7 @@ class App:
         return False
 
     def _refresh_list(self) -> None:
+        """按 ``self.files`` 重建列表并重画选中态（唯一的列表渲染出口）。"""
         self.files_list.delete(0, "end")
         for path in self.files:
             kind = media.kind_of(path)
@@ -398,6 +432,7 @@ class App:
             self.files_list.selection_set(self._current_index)
 
     def _on_list_select(self, _event=None) -> None:
+        """列表选中变化 -> 切换当前文件（忽略由 _refresh_list 引起的回调回合）。"""
         selection = self.files_list.curselection()
         if not selection:
             return
@@ -406,6 +441,11 @@ class App:
             self._select_file(index)
 
     def _select_file(self, index: int) -> None:
+        """打开第 ``index`` 个文件并把它显示出来。
+
+        先 ``_close_doc`` 再打开：同一时刻只有一个文档句柄 —— Windows 下不关就会
+        锁住源文件（WinError 32），表现为原文件删不掉、改不了名。
+        """
         if not (0 <= index < len(self.files)):
             return
         self._current_index = index
@@ -445,6 +485,7 @@ class App:
         self.preview.show_placeholder("error", f"无法打开该文件：\n{name}\n{exc}")
 
     def _remove_selected(self) -> None:
+        """删除选中项并把选中落到「原来的下一个」上（不跳回文件头）。"""
         if self._list_locked():
             return
         selection = self.files_list.curselection()
@@ -463,6 +504,7 @@ class App:
             self.preview.show_placeholder("empty", "把文件拖到这里，或点击「选择文件」")
 
     def _clear_files(self) -> None:
+        """清空列表：连页码导航与预览占位一起复位（否则会留着上一张的页数）。"""
         if self._list_locked():
             return
         self._close_doc()
@@ -478,13 +520,19 @@ class App:
     # ------------------------------------------------------------------
 
     def _on_spec_change(self, _spec: WatermarkSpec) -> None:
+        """参数面板的变更回调：唯一的动作就是**排一次预览**（防抖在 fused 内部）。"""
         self._schedule_preview()
 
     def _on_canvas_resize(self) -> None:
+        """画布尺寸变化：用更短的防抖跟手（拖窗口边缘是连续触发的）。"""
         self._schedule_preview(PREVIEW_DEBOUNCE_RESIZE_MS)
 
     def _schedule_preview(self, delay: Optional[int] = None) -> None:
         if self._closing:
+            return
+        if self._busy:
+            # 批处理期间一律不排预览：即便参数面板已被冻结，翻页 / 画布缩放等
+            # 入口仍可能走到这里。预览与批处理并行会**叠加**两份全分辨率图像。
             return
         self._cancel_after(self._preview_job)
         self._preview_job = None
@@ -492,6 +540,7 @@ class App:
         self._preview_job = self.root.after(wait, self._render_preview_async)
 
     def _on_page_change(self, delta: int) -> None:
+        """翻页；越界静默忽略（边界上的按钮本就该失效）。"""
         if self.doc is None:
             return
         target = self.page_index + delta
@@ -538,11 +587,26 @@ class App:
             daemon=True,
         ).start()
 
+    def _preview_stale(self, gen: int) -> bool:
+        """该帧是否已作废：关窗中，或已被更新的一代取代（用户又改了参数 / 翻页）。
+
+        它同时充当**取消信号**传给预览渲染 —— 旧行为是「跑完再丢」，而最贵的一帧
+        （8000×8000 单帧 +777MB）恰恰是最该早点停下来的那种。注意这里**不**看
+        ``_preview_pending``：pending 只是「待补跑」，不代表当前帧失效。
+        """
+        return self._closing or gen != self._preview_gen
+
     def _preview_worker(self, gen: int, path: str, page: int, spec: WatermarkSpec,
                         canvas_w: int, canvas_h: int) -> None:
         try:
             out, page_w, page_h = preview_job.render_preview(
-                path, page, spec, canvas_w, canvas_h)
+                path, page, spec, canvas_w, canvas_h,
+                is_cancelled=lambda: self._preview_stale(gen))
+            if out is preview_job.CANCELLED:
+                # 作废帧（含被取消的）：**不能**当错误处理 —— 否则拖滑杆时预览区会
+                # 反复闪「预览失败」。
+                self._queue.put({"kind": "preview", "gen": gen, "cancelled": True})
+                return
             if out is None:
                 # 打开 / 渲染失败：preview_job 已吞掉异常并返回 None，这里按原始
                 # _preview_worker 的 error 载荷上报（不含 page_w / page_h）。
@@ -578,6 +642,18 @@ class App:
         self.out_dir = None
         self.out_label.configure(text="输出：与原文件同目录")
 
+    @property
+    def suffix(self) -> str:
+        """输出文件名的中缀（已净化，永不为空）。"""
+        return safe_suffix(self.suffix_var.get())
+
+    def _on_suffix_commit(self, _event=None) -> None:
+        """输入提交：净化后回填，让用户看见「实际生效的是什么」。"""
+        cleaned = self.suffix
+        if self.suffix_var.get() != cleaned:
+            self.suffix_var.set(cleaned)
+        return "break"
+
     # ------------------------------------------------------------------
     # 批处理
     # ------------------------------------------------------------------
@@ -592,11 +668,13 @@ class App:
         spec = self.panel.spec()
         files = list(self.files)
         out_dir = self.out_dir
+        suffix = self.suffix
         self._set_busy(True)
         self.progress.configure(value=0.0)
         self.status.configure(text=f"正在准备… 0/{len(files)} 个文件")
         self._batch_thread = threading.Thread(target=self._batch_worker,
-                                              args=(files, spec, out_dir), daemon=True)
+                                              args=(files, spec, out_dir, suffix),
+                                              daemon=True)
         self._batch_thread.start()
 
     def _cancel_batch(self) -> None:
@@ -605,6 +683,11 @@ class App:
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
+        # **参数面板整块冻结**（不只是按钮）：批处理期间拖一次滑杆就会起一个
+        # 预览线程，它会另起一份全分辨率图像（8000×8000 单帧 +777MB）并与批处理
+        # 争内存 —— 两者叠加可致进程被系统杀掉且无任何报错。冻结后既改不动参数
+        # 也不会触发预览（``ParamPanel._emit`` 在禁用态直接返回），双保险。
+        self.panel.set_enabled(not busy)
         self.start_btn.set_enabled(not busy)
         self.add_btn.set_enabled(not busy)
         # 批处理进行中不允许改动文件列表与输出目录，避免与后台任务状态混淆
@@ -612,10 +695,17 @@ class App:
         self.clr_btn.set_enabled(not busy)
         self.out_btn.set_enabled(not busy)
         self.out_reset_btn.set_enabled(not busy)
+        # 后缀是**本次批处理**的一部分（已拷进工作线程），中途改会造成「做完的文件
+        # 老后缀、剩下的新后缀」，比完全不允许改更糟
+        try:
+            self.suffix_entry.configure(state="normal" if not busy else "disabled",
+                                        fg=T.TEXT if not busy else T.TEXT_FAINT)
+        except Exception:
+            pass
         self.cancel_btn.set_enabled(busy)
 
     def _batch_worker(self, files: List[str], spec: WatermarkSpec,
-                      out_dir: Optional[str]) -> None:
+                      out_dir: Optional[str], suffix: str = DEFAULT_SUFFIX) -> None:
         total = len(files)
 
         def _on_progress(done: int, count: int, label: str, index: int) -> None:
@@ -637,16 +727,23 @@ class App:
             is_cancelled=lambda: self._cancel,
             on_progress=_on_progress,
             on_log=_on_log,
-            on_done=_on_done)
+            on_done=_on_done,
+            suffix=suffix)
 
     @staticmethod
-    def _save_image(out: Image.Image, dst: str, exif: Optional[bytes] = None) -> None:
+    def _save_image(
+        out: Image.Image,
+        dst: str,
+        exif: Optional[bytes] = None,
+        dpi: Optional[Tuple[int, int]] = None,
+        icc_profile: Optional[bytes] = None,
+    ) -> None:
         """按输出扩展名选择合适的保存方式（有损格式压平 alpha）。
 
         业务逻辑已抽到 :func:`wm.ui.output.save_image`，这里仅作薄封装以保留对外
         口径（``App._save_image(...)`` / ``ui_app.App._save_image(...)`` 仍可用）。
         """
-        return output.save_image(out, dst, exif)
+        return output.save_image(out, dst, exif, dpi=dpi, icc_profile=icc_profile)
 
     @staticmethod
     def _write_image(image: Image.Image, dst: str, params: Dict[str, object]) -> None:
@@ -686,6 +783,8 @@ class App:
         if kind == "preview":
             if self._closing:
                 return  # 关窗后不再贴图（画布已随 root 消失）
+            if item.get("cancelled"):
+                return  # 作废 / 已取消的帧：什么都不做（既不该贴图也不该报错）
             if item.get("gen") != self._preview_gen:
                 return  # 过期帧，丢弃
             if item.get("error"):

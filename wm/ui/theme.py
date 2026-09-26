@@ -1387,6 +1387,7 @@ class ColorField(tk.Frame):
         self._command = command
         self._value = value
         self._bg = bg
+        self._enabled = True
         #: [(归一化色值, 色块 Canvas)]，供 _redraw 画选中态
         self._chips: List[Tuple[str, tk.Canvas]] = []
 
@@ -1400,15 +1401,26 @@ class ColorField(tk.Frame):
             chip = tk.Canvas(chips, width=px(22), height=px(22), bg=bg,
                              highlightthickness=0, bd=0, cursor="hand2")
             chip.pack(side="left", padx=(0, px(SP_XS)))
-            chip.create_rectangle(px(1), px(1), px(21), px(21), fill=color,
-                                  outline=BORDER_SOFT)
             chip.bind("<Button-1>", lambda _e, c=color: self._set(c))
             chip.bind("<Enter>", lambda _e, c=chip: self._on_chip_enter(c))
             chip.bind("<Leave>", lambda _e, c=chip: self._on_chip_leave(c))
             self._chips.append((normalize_color(color), chip))
         self._redraw()
 
+    # -- 启用 / 禁用 --------------------------------------------------------
+
+    def set_enabled(self, enabled: bool) -> None:
+        """禁用态：色块整体变淡，且点不动（批处理期间冻结参数用）。"""
+        self._enabled = bool(enabled)
+        self._redraw()
+
+    def _chip_fill(self, color: str) -> str:
+        """色块填充色：禁用时向底色插值 65%，一眼能看出"点不了"。"""
+        return color if self._enabled else mix(color, self._bg, 0.65)
+
     def _set(self, color: str) -> None:
+        if not self._enabled:
+            return
         from ..spec import normalize_color
         self._value = normalize_color(color)
         self._redraw()
@@ -1427,15 +1439,17 @@ class ColorField(tk.Frame):
         chip.delete("hl")
 
     def _redraw(self) -> None:
-        """在「当前选中色」对应的预设色块上画 accent 描边。
+        """重画全部色块：底色按启用态插值，选中项再叠一圈 accent 描边。
 
         取代旧实现里单独的「当前色块 + 十六进制文本」——预设色块自身即反馈。
         """
         from ..spec import normalize_color
         sel = normalize_color(self._value)
         for color, chip in self._chips:
-            chip.delete("sel")
-            if color == sel:
+            chip.delete("all")
+            chip.create_rectangle(px(1), px(1), px(21), px(21),
+                                  fill=self._chip_fill(color), outline=BORDER_SOFT)
+            if color == sel and self._enabled:
                 chip.create_rectangle(px(0.5), px(0.5), px(21.5), px(21.5),
                                       outline=ACCENT, width=px(2), tags="sel")
 
@@ -1458,6 +1472,7 @@ class TextArea(tk.Frame):
         super().__init__(parent, bg=bg)
         self._command = command
         self._bg = bg
+        self._enabled = True
         self.text = tk.Text(self, height=height, wrap="word", bg=CONTROL, fg=TEXT,
                             relief="flat", bd=0, highlightthickness=px(1),
                             highlightbackground=FIELD_LINE, highlightcolor=ACCENT,
@@ -1468,11 +1483,23 @@ class TextArea(tk.Frame):
         self.text.bind("<<Modified>>", self._on_modified)
         self.text.bind("<KeyRelease>", self._on_modified)
 
+    def set_enabled(self, enabled: bool) -> None:
+        """禁用态：只读 + 文字变淡（``tk.Text`` 禁用后 ``get()`` 仍可读）。
+
+        用 ``state="disabled"`` 而不是「解绑事件」：后者只是挡住键盘，粘贴与
+        ``set()`` 仍能改内容，视觉上也看不出是禁用。
+        """
+        self._enabled = bool(enabled)
+        self.text.configure(state="normal" if enabled else "disabled",
+                            fg=TEXT if enabled else TEXT_FAINT)
+
     def _on_modified(self, _event=None) -> None:
         try:
             self.text.edit_modified(False)
         except tk.TclError:
             pass
+        if not self._enabled:
+            return  # 禁用期的改动不算数（也不该触发预览）
         if self._command is not None:
             self._command(self.get())
 
@@ -1480,8 +1507,17 @@ class TextArea(tk.Frame):
         return self.text.get("1.0", "end-1c")
 
     def set(self, value: str, notify: bool = False) -> None:
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", value)
+        # 禁用态下 tk.Text 拒绝写入：写之前临时放开，写完恢复禁用 —— 否则
+        # 「恢复默认 / 载入配置」在冻结期间会直接抛 TclError。
+        was_disabled = not self._enabled
+        if was_disabled:
+            self.text.configure(state="normal")
+        try:
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", value)
+        finally:
+            if was_disabled:
+                self.text.configure(state="disabled")
         if notify and self._command is not None:
             self._command(value)
 
