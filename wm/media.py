@@ -234,7 +234,7 @@ def unique_path(path: str) -> str:
 
 
 def plan_output(src: str, out_dir: Optional[str] = None, suffix: str = DEFAULT_SUFFIX) -> str:
-    """规划输出路径：默认同目录 + ``_watermarked`` 后缀，绝不覆盖原文件。"""
+    """规划输出路径：默认同目录 + ``_水印版`` 后缀，绝不覆盖原文件。"""
     directory = out_dir if out_dir else os.path.dirname(os.path.abspath(src))
     os.makedirs(directory, exist_ok=True)
     root, ext = os.path.splitext(os.path.basename(src))

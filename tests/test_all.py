@@ -455,7 +455,7 @@ def test_output_path_never_overwrites():
 
         first = media.plan_output(src)
         assert first != src
-        assert first.endswith("_watermarked.png")
+        assert first.endswith("_水印版.png")
         assert os.path.dirname(os.path.abspath(first)) == os.path.abspath(tmp)
         assert not os.path.exists(first)
 
@@ -463,7 +463,7 @@ def test_output_path_never_overwrites():
         Image.new("RGB", (20, 20), WHITE).save(first)
         second = media.plan_output(src)
         assert second != first
-        assert second.endswith("_watermarked(1).png")
+        assert second.endswith("_水印版(1).png")
         assert not os.path.exists(second)
 
         # 指定输出目录

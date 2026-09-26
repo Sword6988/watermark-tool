@@ -43,8 +43,8 @@ def run_batch(
       * 每个文件处理完后的整体进度（``done=count=1``、``label=""``、``index``=文件下标），
         由调用方据此重建 ``(index + 1) / total`` 的整条进度。
 
-    ``suffix`` 是输出文件名的中缀（默认 ``_watermarked``）。调用方（UI）应当用
-    :func:`wm.spec.safe_suffix` 清理用户输入后再传进来 —— 本函数不做净化，
+    ``suffix`` 是输出文件名的中缀（默认 ``_水印版``）。UI 不再提供后缀输入框，
+    传非默认值前请用 :func:`wm.spec.safe_suffix` 清理 —— 本函数不做净化，
     但它也不会改变任何目录：后缀只参与文件名拼接。
     """
     total = len(files)

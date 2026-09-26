@@ -331,7 +331,7 @@ def test_qa_pdf_alpha_preserved_corners():
     assert g > 150 and r > g >= b - 5, f"墨迹不像半透明红叠白：{(r, g, b)}"
 
 
-def test_qa_pdf_mixed_size_pages_all_watermarked():
+def test_qa_pdf_mixed_size_pages_all_水印版():
     """混合尺寸多页 PDF：每一页都要有水印且不越界。"""
     sizes = [(595, 842), (400, 400), (842, 595), (300, 800)]
     spec = WatermarkSpec(text="机密文件", font_pct=4.0, margin_pct=3.0,
@@ -571,7 +571,7 @@ def test_qa_odd_image_formats_render_and_save():
 
 
 def test_qa_repeat_process_increments_and_source_unchanged():
-    """重复处理同一文件：输出名自动递增 _watermarked(1)/_watermarked(2)...；原文件哈希不变。"""
+    """重复处理同一文件：输出名自动递增 _水印版(1)/_水印版(2)...；原文件哈希不变。"""
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "photo.png")
         Image.new("RGB", (100, 80), WHITE).save(src)
@@ -588,8 +588,8 @@ def test_qa_repeat_process_increments_and_source_unchanged():
             finally:
                 doc.close()
         after = hashlib.md5(open(src, "rb").read()).hexdigest()
-        assert names == ["photo_watermarked.png", "photo_watermarked(1).png",
-                         "photo_watermarked(2).png"], names
+        assert names == ["photo_水印版.png", "photo_水印版(1).png",
+                         "photo_水印版(2).png"], names
         assert before == after, "原文件被修改"
 
 
@@ -636,7 +636,7 @@ def test_qa_batch_isolation_and_monotonic_progress():
         assert done and done[0]["succeeded"] == 12, f"成功数不对：{done}"
         assert len(done[0]["failed"]) == 1, f"失败列表不对：{done[0]['failed']}"
         assert any(t.startswith("[FAIL]") and "bad.png" in t for t in logs), "坏文件无明确失败日志"
-        produced = [n for n in os.listdir(tmp) if "_watermarked" in n]
+        produced = [n for n in os.listdir(tmp) if "_水印版" in n]
         assert len(produced) == 12, f"产出文件数不对：{len(produced)}"
 
 

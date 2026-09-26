@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from PIL import Image
 
 from .. import media, render
-from ..spec import DEFAULT_SUFFIX, WatermarkSpec, safe_suffix
+from ..spec import WatermarkSpec
 from . import batch, output, preview_job
 from . import theme as T
 from .panel import ParamPanel
@@ -172,23 +172,6 @@ class App:
         self.out_reset_btn = FluentButton(out_row, "恢复同目录", self._reset_out_dir,
                                           kind="ghost", width=T.px(84))
         self.out_reset_btn.pack(side="right", padx=(0, T.px(T.SP_XS)))
-
-        # 输出后缀：让用户自定义批次标记（如 ``_机密``），默认 ``_watermarked``。
-        # 取值一律经 :func:`wm.spec.safe_suffix` 净化 —— 后缀里一旦含路径分隔符，
-        # 输出就会被写到别的目录（``../`` 更会逃出输出目录）。
-        suffix_row = tk.Frame(files_card, bg=T.PANEL)
-        suffix_row.pack(fill="x", pady=(0, T.px(T.SP_MD)))
-        tk.Label(suffix_row, text="输出后缀（文件名追加的部分）", bg=T.PANEL,
-                 fg=T.TEXT_FAINT, font=(T.UI_FAMILY, T.sf(9))).pack(side="left")
-        self.suffix_var = tk.StringVar(value=DEFAULT_SUFFIX)
-        self.suffix_entry = tk.Entry(
-            suffix_row, textvariable=self.suffix_var, width=14, justify="right",
-            bg=T.CONTROL, fg=T.TEXT, relief="flat", bd=0, insertwidth=T.px(1),
-            highlightthickness=T.px(1), highlightbackground=T.FIELD_LINE,
-            highlightcolor=T.ACCENT, font=(T.UI_FAMILY, T.sf(10)))
-        self.suffix_entry.pack(side="right")
-        self.suffix_entry.bind("<Return>", self._on_suffix_commit)
-        self.suffix_entry.bind("<FocusOut>", self._on_suffix_commit)
 
         # -- 参数面板 ------------------------------------------------------
         self.panel = ParamPanel(left, on_change=self._on_spec_change)
@@ -642,18 +625,6 @@ class App:
         self.out_dir = None
         self.out_label.configure(text="输出：与原文件同目录")
 
-    @property
-    def suffix(self) -> str:
-        """输出文件名的中缀（已净化，永不为空）。"""
-        return safe_suffix(self.suffix_var.get())
-
-    def _on_suffix_commit(self, _event=None) -> None:
-        """输入提交：净化后回填，让用户看见「实际生效的是什么」。"""
-        cleaned = self.suffix
-        if self.suffix_var.get() != cleaned:
-            self.suffix_var.set(cleaned)
-        return "break"
-
     # ------------------------------------------------------------------
     # 批处理
     # ------------------------------------------------------------------
@@ -668,12 +639,11 @@ class App:
         spec = self.panel.spec()
         files = list(self.files)
         out_dir = self.out_dir
-        suffix = self.suffix
         self._set_busy(True)
         self.progress.configure(value=0.0)
         self.status.configure(text=f"正在准备… 0/{len(files)} 个文件")
         self._batch_thread = threading.Thread(target=self._batch_worker,
-                                              args=(files, spec, out_dir, suffix),
+                                              args=(files, spec, out_dir),
                                               daemon=True)
         self._batch_thread.start()
 
@@ -695,17 +665,10 @@ class App:
         self.clr_btn.set_enabled(not busy)
         self.out_btn.set_enabled(not busy)
         self.out_reset_btn.set_enabled(not busy)
-        # 后缀是**本次批处理**的一部分（已拷进工作线程），中途改会造成「做完的文件
-        # 老后缀、剩下的新后缀」，比完全不允许改更糟
-        try:
-            self.suffix_entry.configure(state="normal" if not busy else "disabled",
-                                        fg=T.TEXT if not busy else T.TEXT_FAINT)
-        except Exception:
-            pass
         self.cancel_btn.set_enabled(busy)
 
     def _batch_worker(self, files: List[str], spec: WatermarkSpec,
-                      out_dir: Optional[str], suffix: str = DEFAULT_SUFFIX) -> None:
+                      out_dir: Optional[str]) -> None:
         total = len(files)
 
         def _on_progress(done: int, count: int, label: str, index: int) -> None:
@@ -727,8 +690,7 @@ class App:
             is_cancelled=lambda: self._cancel,
             on_progress=_on_progress,
             on_log=_on_log,
-            on_done=_on_done,
-            suffix=suffix)
+            on_done=_on_done)
 
     @staticmethod
     def _save_image(

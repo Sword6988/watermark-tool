@@ -105,7 +105,7 @@ def test_batch_runs_and_cancels() -> None:
         assert done, "on_done 未回调"
         assert done[0].succeeded == 2, f"成功数应为 2，实际 {done[0].succeeded}"
         assert done[0].cancelled is False
-        produced = [n for n in os.listdir(tmp) if "_watermarked" in n]
+        produced = [n for n in os.listdir(tmp) if "_水印版" in n]
         assert len(produced) == 2, f"产出文件数不对：{len(produced)}"
 
         # -- 一开始就取消：应立即停，不产生任何输出 --
@@ -121,8 +121,8 @@ def test_batch_runs_and_cancels() -> None:
         assert done2, "on_done 未回调"
         assert done2[0].succeeded == 0, f"取消时成功数应为 0，实际 {done2[0].succeeded}"
         assert done2[0].cancelled is True
-        # 不应新增任何 _watermarked 文件（首轮已生成 2 个；这里仍是 2 个）
-        produced2 = [n for n in os.listdir(tmp) if "_watermarked" in n]
+        # 不应新增任何 _水印版 文件（首轮已生成 2 个；这里仍是 2 个）
+        produced2 = [n for n in os.listdir(tmp) if "_水印版" in n]
         assert len(produced2) == 2, f"取消后仍产生了输出：{len(produced2)}"
 
 
