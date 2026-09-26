@@ -171,7 +171,12 @@ def _render_block_bitmap(spec: WatermarkSpec, size_px: float) -> Image.Image:
     bitmap = _draw_text_block(
         spec.lines(), font, _alpha_rgba(spec.color, spec.opacity), angle=angle)
     if abs(angle) > 1e-6:
-        bitmap = bitmap.rotate(angle, expand=True, resample=Image.BICUBIC)
+        # **取负**：``spec.angle`` 的正方向是**顺时针**（与时钟同向，UI 圆盘
+        # ``_AngleDial._unit`` 也是这个约定），而 PIL 的 ``rotate(θ)`` 是逆时针。
+        # 不取负的话，盘上方向线指顺时针 30°、文字却逆时针转 30° —— 两者镜像，
+        # 用户照着盘调出来的角度永远是反的。这一行与 ``_unit`` 是一对，改一个
+        # 必须改另一个（回归用 tests/test_angle_dial.py 的轴向断言守住）。
+        bitmap = bitmap.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
     # 超大块**不进缓存**（否则单条就把预算撑爆、触发反复清仓），普通块按字节预算淘汰
     if _bitmap_cost(bitmap) <= _RENDER_CACHE_BYTES:

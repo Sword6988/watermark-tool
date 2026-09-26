@@ -3,11 +3,15 @@
 对应实现：``wm/ui/theme.py`` 的 ``_AngleDial``（由 ``SliderField(dial=True)`` 使用）。
 覆盖的核心契约 —— 这些都是「换成圆盘」之所以成立的前提：
 
-1. **几何反算**：屏幕点 -> 角度的映射正确（0° 在 3 点钟方向、逆时针为正）；
-   值域是 **-180..180**（循环量），所以「值 v 必须落在角度 v 的位置上」——
-   线性映射 ``lo + ang/360*span`` 只在 lo=0 时成立，这条同时守住那个隐患；
-2. **方向线真的跟着角度转**：0° 是水平线、90° 是竖直线且箭头朝上；
-   这条守的是「盘上的线 = 水印文字走向」这个承诺，画错就等于骗用户；
+1. **几何反算**：屏幕点 -> 角度的映射正确（0° 在 3 点钟方向、**顺时针为正**，
+   与读时钟同向）；值域是 **-180..180**（循环量），所以「值 v 必须落在角度 v
+   的位置上」—— 线性映射 ``lo + ang/360*span`` 只在 lo=0 时成立，这条同时守住
+   那个隐患；
+2. **方向线真的跟着角度转**：0° 是水平线、90° 是竖直线且箭头朝**下**（顺时针）；
+   这条守的是「盘上的线 = 水印文字走向」这个承诺，画错就等于骗用户。
+   注意 PIL 的 ``rotate`` 是逆时针，故 ``wm.layout`` 传 ``rotate(-angle)`` 补偿；
+   那边若漏了负号，本组测试**测不出来**（盘和渲染会各自反着来），
+   由 ``_smoke/dial_clockwise_probe.py`` 做端到端主轴比对兜底；
 3. **循环量语义**：接缝只出现在 ±180（文字倒置，最少用），跨 0° 必须**连续**
    （旧值域 0–360 把接缝压在 0° 上，拖过就 359->0 横跳，已修）；越界一律钳制；
 4. 三档吸附：**默认 5°、Shift 15°、Alt 不吸附**（半径 40px 时 1px ≈ 1.43°，
@@ -59,11 +63,15 @@ class _Ev:
 
 
 def _pts(dial, value):
-    """返回「在圆环上位于 ``value`` 角度」处的画布坐标。"""
+    """返回「在圆环上位于 ``value`` 角度」处的画布坐标。
+
+    **顺时针为正**（屏幕 y 轴向下 ⇒ ``+sin``），与 ``_AngleDial._unit`` 同约定；
+    写反会让整组测试「跟着一起错」，于是方向翻转这类改动就测不出来了。
+    """
     c = dial._center()
     r = dial._radius()
     rad = math.radians(value)
-    return c + math.cos(rad) * r, c - math.sin(rad) * r
+    return c + math.cos(rad) * r, c + math.sin(rad) * r
 
 
 def _img(dial):
@@ -99,7 +107,7 @@ def _line_dist(dial, value, side, span=(0.30, 0.65)):
     ref = _hex2rgb(T.DIAL_LINE)
     c, r = dial._center(), dial._radius()
     rad = math.radians(value)
-    ux, uy = math.cos(rad), -math.sin(rad)
+    ux, uy = math.cos(rad), math.sin(rad)     # 顺时针为正，与 _unit 一致
     best = 10 ** 9
     steps = 9
     for i in range(steps):
@@ -123,16 +131,17 @@ def _same_dir(got: float, expect: float, tol: float = 1e-6) -> bool:
 
 
 def test_dial_maps_click_position_to_angle():
-    """几何反算：3 点钟 → 0°、12 点钟 → 90°、9 点钟 → ±180°、6 点钟 → -90°。
+    """几何反算：3 点钟 → 0°、6 点钟 → 90°、9 点钟 → ±180°、12 点钟 → -90°。
 
-    「值 v 显示在角度 v 的位置上」—— 值域是 -180..180，所以 6 点钟（屏幕 270°）
+    **顺时针为正**（时钟同向）：6 点钟是 +90 而非 -90，12 点钟才是 -90。
+    「值 v 显示在角度 v 的位置上」—— 值域是 -180..180，所以 12 点钟（屏幕 270°）
     必须给出 **-90** 而不是 270，9 点钟给出 ±180。
     """
     root = _root()
     try:
         dial, calls = _make_dial(root)
-        for expect, where in ((0, "3 点钟"), (90, "12 点钟"),
-                              (180, "9 点钟"), (-90, "6 点钟")):
+        for expect, where in ((0, "3 点钟"), (90, "6 点钟"),
+                              (180, "9 点钟"), (-90, "12 点钟")):
             x, y = _pts(dial, expect)
             got = dial._value_of(x, y)
             assert _same_dir(got, expect), \
@@ -169,12 +178,12 @@ def test_dial_direction_line_follows_angle():
 
         dial.set(0)
         img = _img(dial)
-        # 0°：正方向（右半轴）应是线；正上方不应有线
+        # 0°：正方向（右半轴）应是线；90° 方向（顺时针 ⇒ 正下方）不应有线
         assert _line_dist(dial, 0, 1) <= _ON, "0° 的正方向应朝屏幕右侧（与水印文字走向一致）"
-        assert _line_dist(dial, 90, 1) >= _OFF, "0° 时正上方不应有线"
+        assert _line_dist(dial, 90, 1) >= _OFF, "0° 时 90° 方向（正下方）不应有线"
 
         dial.set(90)
-        assert _line_dist(dial, 90, 1) <= _ON, "90° 的正方向应朝屏幕上方（逆时针为正）"
+        assert _line_dist(dial, 90, 1) <= _ON, "90° 的正方向应朝屏幕下方（顺时针为正）"
         assert _line_dist(dial, 0, 1) >= _OFF, "90° 时右侧半轴不应有线"
 
         # 「贯穿圆心」的判据：正、反两个方向的半轴上**都**有线的颜色

@@ -33,7 +33,7 @@ _MARGIN_HINT = "每个水印四周留白"
 #: 否则圆形方向线容易被当成纯装饰；顺带交代 Shift 吸附这个隐藏操作。
 # 用词避开「拖动 / 偏移 / 位置调节」：有独立测试断言界面里**不出现**任何位置
 # 调节入口的文案（水印位置由系统固定），这里是转盘角度，不是拖位置。
-_ANGLE_HINT = "盘上方向线即文字走向；转盘默认吸附 5°（Shift 15°，Alt 1°）"
+_ANGLE_HINT = "盘上方向线即文字走向，顺时针为正；转盘默认吸附 5°（Shift 15°，Alt 1°）"
 
 
 class ScrolledFrame(tk.Frame):
@@ -201,6 +201,8 @@ class ParamPanel(tk.Frame):
         self.margin_pct.pack(fill="x")
         # 角度是**循环量**（0° 与 360° 是同一个方向），线性轨道上它们却分居两端 ——
         # 用圆盘表示才对；盘上那条贯穿圆心的方向线就是水印文字的真实走向。
+        # 正方向取**顺时针**（与读时钟同向）：PIL 的 rotate 是逆时针，故
+        # wm.layout 渲染时传 rotate(-angle) 补偿，两处是一对、改一个必须改另一个。
         self.angle = SliderField(root, "旋转角度", *ANGLE_RANGE, self._spec.angle, ANGLE_STEP,
                                  self._on_angle, unit="°", dial=True, hint=_ANGLE_HINT)
         self.angle.pack(fill="x", pady=(T.px(T.SP_XXL), 0))

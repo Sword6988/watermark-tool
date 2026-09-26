@@ -602,11 +602,15 @@ class _AngleDial(tk.Canvas):
     def _unit(self):
         """当前角度对应的单位方向向量。
 
-        屏幕 y 轴向下，故 ``dy`` 取负 —— 这样角度增大在屏幕上表现为逆时针，
-        与 ``PIL.Image.rotate`` 的正方向一致。
+        屏幕 y 轴向下，``dy`` 取**正** —— 于是角度增大在屏幕上表现为**顺时针**
+        （3 点钟 0° → 6 点钟 90°），符合读时钟的直觉。
+
+        ⚠️ 这与 ``PIL.Image.rotate`` 的正方向（逆时针）**相反**，所以渲染侧
+        ``wm.layout`` 必须传 ``rotate(-angle)`` 补偿；否则盘上的方向线会与
+        水印文字的真实走向镜像 —— 那等于骗用户。改这里请连那边一起改。
         """
         rad = math.radians(self._value)
-        return math.cos(rad), -math.sin(rad)
+        return math.cos(rad), math.sin(rad)
 
     def _dist(self, x: float, y: float) -> float:
         c = self._center()
@@ -621,7 +625,9 @@ class _AngleDial(tk.Canvas):
         中点）。正确做法：以 ``lo`` 为原点取模，把屏幕角搬进值域，再夹到上界。
         """
         c = self._center()
-        ang = math.degrees(math.atan2(-(y - c), x - c)) % 360.0
+        # 屏幕 y 向下 ⇒ atan2(y - c, ...) 的正方向即屏幕上的**顺时针**，
+        # 与 _unit() 保持一致（反算必须与正算互逆，否则拖到哪儿值就不在哪儿）。
+        ang = math.degrees(math.atan2(y - c, x - c)) % 360.0
         value = self._lo + math.fmod(ang - self._lo, 360.0)
         # ±180 是同一条直径：统一取 +180（与 spec.wrap_deg 的半开半闭约定一致）
         if abs(value - self._lo) < 1e-9 and self._lo < 0.0:
