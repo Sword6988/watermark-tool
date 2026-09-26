@@ -106,8 +106,11 @@ class Document:
     解码整张图），因此不影响「打开大图不额外驻留像素」的性能约束。
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, read_path: Optional[str] = None) -> None:
         self.path = str(path)
+        #: 实际读取路径。加密文件解密后指向临时明文；默认与 ``path`` 相同。
+        #: **输出命名一律用 ``path``**（原文件旁出图），只有"读"走 ``read_path``。
+        self.read_path = str(read_path) if read_path else self.path
         self.kind = kind_of(self.path)
         if self.kind is None:
             raise ValueError(f"不支持的文件类型：{self.path}")
@@ -121,7 +124,7 @@ class Document:
         #: 源图 ICC 色彩配置；PDF / 无 ICC / 色彩空间不可直传时为 None
         self.icc_profile: Optional[bytes] = None
         if self.kind == KIND_IMAGE:
-            source_image = Image.open(self.path)
+            source_image = Image.open(self.read_path)
             try:
                 # 只读头部元数据不会解码整张图片。绝大多数图片没有方向标签，或
                 # Orientation=1（已正向）；这些常态路径必须保留 Image.open 的惰性，
@@ -168,7 +171,7 @@ class Document:
                 source_image.close()
                 self._image = normalized_image
         else:
-            self._pdf = fitz.open(self.path)
+            self._pdf = fitz.open(self.read_path)
             self.page_count = self._pdf.page_count
             self.frame_count = 1
 
@@ -190,7 +193,7 @@ class Document:
                 return self._image.convert("RGB")
             # 无需 EXIF 转正的常态路径只在真正取像素时解码；上下文退出前 convert()
             # 已生成独立图像，因此磁盘句柄不会随返回值泄漏到调用方。
-            with Image.open(self.path) as source_image:
+            with Image.open(self.read_path) as source_image:
                 source_image.seek(0)
                 return source_image.convert("RGB")
         assert self._pdf is not None

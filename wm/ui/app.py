@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image
 
-from .. import media
+from .. import dlp, media
 from ..spec import WatermarkSpec
 from . import batch, output, preview_job
 from . import theme as T
@@ -58,6 +58,8 @@ class App:
         """
         self.root = root
         self.files: List[str] = []
+        #: 原路径 → 明文路径（只有**确实解密过**的文件才在表里；见 _resolve_sources）
+        self._plain: Dict[str, str] = {}
         self.doc: Optional[media.Document] = None
         self.page_index = 0
         self.out_dir: Optional[str] = None
@@ -323,7 +325,11 @@ class App:
     # ------------------------------------------------------------------
 
     def _on_drop(self, event) -> None:
-        """拖拽投放：``tkinterdnd2`` 给的是 Tcl 列表串（含空格的路径要用花括号包）。"""
+        """拖拽投放：``tkinterdnd2`` 给的是 Tcl 列表串（含空格的路径要用花括号包）。
+
+        解密不在这里做 —— 交给 :meth:`_add_paths`，与「选择文件」按钮共用同一条
+        解密链路，两条入口行为一致。
+        """
         if self._list_locked():
             return "break"
         try:
@@ -336,11 +342,17 @@ class App:
         return "break"
 
     def add_files(self, paths: List[str]) -> None:
-        """公开入口：把一批路径加入列表（供 main.py / CLI 使用）。"""
+        """公开入口：把一批路径加入列表（供 main.py / CLI / 测试使用）。
+
+        同样走 :meth:`_add_paths`，因此命令行传入的文件也会自动解密。
+        """
         self._add_paths(list(paths))
 
     def _choose_files(self) -> None:
-        """「选择文件」按钮 / 预览区空态的共用入口（多选）。"""
+        """「选择文件」按钮 / 预览区空态的共用入口（多选）。
+
+        解密不在这里做 —— 交给 :meth:`_add_paths`，与拖拽投放共用同一条解密链路。
+        """
         paths = filedialog.askopenfilenames(
             title="选择图片或 PDF",
             filetypes=[("图片 / PDF", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif *.pdf"),
@@ -349,7 +361,11 @@ class App:
             self._add_paths(list(paths))
 
     def _add_paths(self, paths: List[str]) -> None:
-        """把一批路径并入列表：目录**递归第一层**、文件按类型过滤、全局去重。
+        """把一批路径并入列表：目录**递归第一层**、文件按类型过滤、加密探测与解密、全局去重。
+
+        这是「选择文件」按钮（``_choose_files``）与拖拽投放（``_on_drop``）的**唯一
+        汇聚点**，所以解密只在**这里**挂载一次 —— 两条入口的行为必然一致，用户也
+        不需要任何额外的手动解密步骤。
 
         目录只展开一层：用户拖进来一个大型素材库时，递归遍历的子目录往往包含
         上万张缩略图，与其把界面卡死，不如让他再拖一次。
@@ -379,13 +395,101 @@ class App:
         # 去重
         seen = set(self.files)
         fresh = [p for p in added if not (p in seen or seen.add(p))]
+        usable: List[str] = []
         if fresh:
-            self.files.extend(fresh)
-            self._refresh_list()
-            if self._current_index < 0:
-                self._select_file(0)
-        if skipped and not fresh:
+            # 解密发生在**入列表之前**：进到 self.files 的一律是"读得开"的文件，
+            # 后续预览 / 批处理完全不感知加密这件事。
+            usable, failures = self._resolve_sources(fresh)
+            if usable:
+                self.files.extend(usable)
+                self._refresh_list()
+                if self._current_index < 0:
+                    self._select_file(0)
+            if failures:
+                self._report_dlp_failures(failures)
+        if skipped and not usable:
             messagebox.showwarning(TITLE, "以下文件类型不支持，已跳过：\n" + "\n".join(skipped[:8]))
+
+    # -- 加密文件的探测与解密（添加阶段一次性完成） ------------------------
+
+    def _resolve_sources(self, paths: List[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+        """对一批新路径做「加密探测 → 按需解密」，返回 ``(可用原路径, 失败清单)``。
+
+        * **未加密 / 已可读** → 原路径直接返回，与接入前**零差异**（只多读 3 字节）；
+        * **加密且能解密** → 明文落到受控临时目录，记进 ``self._plain``；
+        * **加密且解不了** → 记进失败清单，**不进列表**，不影响同批其它文件。
+
+        解密是同步的：非加密文件的探测开销可忽略（每文件一次 3 字节读），真正
+        会慢的只有"确实需要解密"的文件，且每处理一个就泵一次 Tk 事件，
+        避免大批量时被系统判成无响应。
+        """
+        usable: List[str] = []
+        failures: List[Tuple[str, str]] = []
+        direct = 0
+        for path in paths:
+            result = dlp.resolve(path)
+            if result.path is None:
+                failures.append((path, result.message or "无法解密"))
+                continue
+            if result.state == dlp.STATE_DIRECT:
+                # 命中加密魔数但读得开：白名单已生效 / 魔数误判，按原样继续
+                direct += 1
+            if result.read_path and result.read_path != result.path:
+                self._plain[result.path] = result.read_path
+            usable.append(result.path)
+            if len(paths) > 1:
+                self._pump()
+        if direct:
+            self._set_status(f"{direct} 个文件疑似受加密保护，已按原样读取", T.WARN)
+        return usable, failures
+
+    @staticmethod
+    def _report_dlp_failures(failures: List[Tuple[str, str]]) -> None:
+        """把「解不了」的文件**逐条**告诉用户（失败绝不静默）。
+
+        只弹一次汇总框，不在循环里逐个弹 —— 拖 50 个文件时弹 50 次等于把工具堵死。
+        """
+        lines = [f"{os.path.basename(path)}：{reason}" for path, reason in failures[:8]]
+        if len(failures) > 8:
+            lines.append(f"…等共 {len(failures)} 个文件")
+        messagebox.showwarning(
+            TITLE, "以下文件受加密保护且无法在当前环境解密，已跳过：\n" + "\n".join(lines))
+
+    def _plain_map(self) -> Dict[str, str]:
+        """``self._plain`` 的访问器。
+
+        用 ``App.__new__`` 造出的**未初始化实例**（QA 用例直接调 ``_batch_worker``）
+        没有这个属性；这里兜底成空表，而不是让批处理线程带着 AttributeError 死掉。
+        """
+        mapping = getattr(self, "_plain", None)
+        if mapping is None:
+            mapping = {}
+            self._plain = mapping
+        return mapping
+
+    def _read_path(self, path: str) -> str:
+        """原路径 → 实际读取路径（解密过的指向临时明文，其余原样）。"""
+        return self._plain_map().get(path, path)
+
+    def _release_plain(self, path: Optional[str]) -> None:
+        """释放某个文件对应的临时明文（从列表移除 / 清空 / 关窗时调用）。"""
+        if not path:
+            return
+        plain = self._plain_map().pop(path, None)
+        if plain:
+            dlp.release(plain)
+
+    def _release_all_plain(self) -> None:
+        """释放本实例持有的全部临时明文（关窗时）。"""
+        for path in list(self._plain_map()):
+            self._release_plain(path)
+
+    def _pump(self) -> None:
+        """泵一次 Tk 事件（保持界面不僵死）；控件已销毁时静默。"""
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     def _list_locked(self) -> bool:
         """批处理进行中：文件列表只读（命中时顺带说明原因）。
@@ -437,7 +541,9 @@ class App:
         self.files_list.see(index)
         self._close_doc()
         try:
-            self.doc = media.Document(self.files[index])
+            # read_path：加密文件已在添加阶段解密，这里读的是临时明文
+            self.doc = media.Document(self.files[index],
+                                      read_path=self._read_path(self.files[index]))
             if self.doc.page_count <= 0:
                 raise ValueError("文件不含任何页面（0 页）")
             self.doc.page_size(0)  # 探活：取不到页面尺寸（0 页 / 加密）会在此抛错
@@ -475,6 +581,7 @@ class App:
         if not selection:
             return
         index = int(selection[0])
+        self._release_plain(self.files[index])  # 解密产物随文件一起出列
         del self.files[index]
         self._close_doc()
         self._current_index = -1
@@ -491,6 +598,7 @@ class App:
         if self._list_locked():
             return
         self._close_doc()
+        self._release_all_plain()
         self.files = []
         self._current_index = -1
         self._refresh_list()
@@ -566,7 +674,9 @@ class App:
         self._preview_pending = False
         threading.Thread(
             target=self._preview_worker,
-            args=(gen, self.doc.path, self.page_index, self.panel.spec(), canvas_w, canvas_h),
+            # 预览读的是**明文路径**（加密文件解密后的临时文件），不是原路径
+            args=(gen, getattr(self.doc, "read_path", None) or self.doc.path,
+                  self.page_index, self.panel.spec(), canvas_w, canvas_h),
             daemon=True,
         ).start()
 
@@ -690,7 +800,10 @@ class App:
             is_cancelled=lambda: self._cancel,
             on_progress=_on_progress,
             on_log=_on_log,
-            on_done=_on_done)
+            on_done=_on_done,
+            # 解密在添加阶段已完成，这里只负责把原路径换成明文路径；
+            # 输出命名仍按原路径（见 batch.run_batch）
+            read_path=self._read_path)
 
     @staticmethod
     def _save_image(
@@ -807,6 +920,7 @@ class App:
         self._preview_job = None
         self._preview_gen += 1  # 作废在途预览结果，避免关窗后往死画布贴图
         self._close_doc()
+        self._release_all_plain()  # 解密出的临时明文绝不留在磁盘上
         self._join_batch(_CLOSE_JOIN_SEC)
 
     def _cancel_after(self, job: Optional[str]) -> None:

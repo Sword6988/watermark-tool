@@ -22,6 +22,9 @@ ProgressFn = Callable[[int, int, str, int], None]
 LogFn = Callable[[str], None]
 DoneFn = Callable[[int, "list", bool], None]
 CancelFn = Callable[[], bool]
+#: 把"原路径"换成"实际读取路径"（加密文件解密后的临时明文）。
+#: 不传时等价于恒等映射 —— 未接入解密时行为与原来完全一致。
+ReadPathFn = Callable[[str], str]
 
 
 def run_batch(
@@ -34,6 +37,7 @@ def run_batch(
     on_log: LogFn,
     on_done: DoneFn,
     suffix: str = DEFAULT_SUFFIX,
+    read_path: Optional[ReadPathFn] = None,
 ) -> None:
     """逐文件加水印并写出；通过回调上报进度 / 日志 / 完成。
 
@@ -46,6 +50,10 @@ def run_batch(
     ``suffix`` 是输出文件名的中缀（默认 ``_水印版``）。UI 不再提供后缀输入框，
     传非默认值前请用 :func:`wm.spec.safe_suffix` 清理 —— 本函数不做净化，
     但它也不会改变任何目录：后缀只参与文件名拼接。
+
+    ``read_path``：可选的原路径 → 读取路径映射。加密文件在**添加阶段**就已解密
+    （见 :meth:`wm.ui.app.App._add_paths`），这里只是按映射取明文路径；输出仍按
+    **原路径**命名（``plan_output(path, ...)``），绝不会写到临时明文目录里。
     """
     total = len(files)
     succeeded = 0
@@ -53,13 +61,14 @@ def run_batch(
     for index, path in enumerate(files):
         if is_cancelled():
             break
+        src = read_path(path) if read_path is not None else path
         try:
-            doc = media.Document(path)
+            doc = media.Document(path, read_path=src)
             try:
                 dst = media.plan_output(path, out_dir, suffix=suffix)
                 if doc.kind == media.KIND_PDF:
                     pages = render.render_pdf(
-                        path, dst, spec,
+                        src, dst, spec,
                         progress=lambda done, count, label, i=index: on_progress(
                             done, count, label, i),
                         is_cancelled=is_cancelled)

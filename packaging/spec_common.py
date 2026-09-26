@@ -29,7 +29,7 @@ def _detect_version() -> str:
     try:
         from wm import __version__ as _version
     except Exception:
-        return "1.0.2"
+        return "1.0.3"
     return str(_version)
 
 
