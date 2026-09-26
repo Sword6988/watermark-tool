@@ -289,7 +289,7 @@ def test_dlp_without_provider_encrypted_file_is_skipped_with_reason():
             _use_provider(None)
             result = dlp.resolve(secret)
             assert result.path is None, "解不了就不能进列表"
-            assert "未配置解密器" in result.message, "原因要可行动（提示找谁授权）"
+            assert "没有可用的解密组件" in result.message, "原因要可行动（提示找谁授权）"
 
             warnings: List[str] = []
             application = ui_app.App(root)
@@ -392,6 +392,209 @@ def test_dlp_command_provider_never_touches_the_source():
             assert not os.path.exists(secret + ".dec_"), "不得在原文件旁留产物"
         finally:
             dlp.release(dst)
+
+
+def test_dlp_lddec_is_auto_enabled_when_dec_exe_is_deployed():
+    """内置通道：程序目录下有 dec.exe + config.json 就自动启用，零配置。"""
+    previous = dlp.get_provider()
+    original_app_dir = dlp.app_dir
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            deployed = os.path.join(tmp, "LDDec")
+            os.makedirs(deployed)
+            exe = os.path.join(deployed, "dec.exe")
+            with open(exe, "wb") as handle:
+                handle.write(b"fake")
+            with open(os.path.join(deployed, "config.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"port": 34500, "faker": "notepad.exe"}')
+            dlp.app_dir = lambda: tmp
+            dlp.reset_provider()
+            provider = dlp.get_provider()
+            assert isinstance(provider, dlp.LddecProvider), \
+                "部署了 dec.exe 就必须自动启用 LDDec 通道"
+            assert provider.exe == exe and provider.available()
+            assert dlp.find_lddec() == exe
+    finally:
+        dlp.app_dir = original_app_dir
+        dlp.reset_provider()
+        dlp.set_provider(previous)
+
+
+def test_dlp_find_lddec_prefers_lDDec_subdir_and_env_override():
+    """自动发现：环境变量优先，其次是 LDDec/、tools/LDDec/、程序目录本身。"""
+    original_env = os.environ.get("WM_LDDEC_EXE")
+    original_app_dir = dlp.app_dir
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "LDDec"))
+            os.makedirs(os.path.join(tmp, "tools", "LDDec"))
+            first = os.path.join(tmp, "LDDec", "dec.exe")
+            second = os.path.join(tmp, "tools", "LDDec", "dec.exe")
+            third = os.path.join(tmp, "dec.exe")
+            for path in (first, second, third):
+                with open(path, "wb") as handle:
+                    handle.write(b"fake")
+            dlp.app_dir = lambda: tmp
+            found = dlp.find_lddec()
+            assert found == first, (
+                f"应优先 LDDec/ 子目录：得到 {found}，期望 {first}，"
+                f"WM_LDDEC_EXE={os.environ.get('WM_LDDEC_EXE')!r}")
+            os.environ["WM_LDDEC_EXE"] = second
+            assert dlp.find_lddec() == second, "环境变量应能覆盖"
+            # 环境变量也可以只给「所在目录」
+            os.environ["WM_LDDEC_EXE"] = os.path.join(tmp, "tools", "LDDec")
+            assert dlp.find_lddec() == second, "环境变量允许只给所在目录"
+            os.environ.pop("WM_LDDEC_EXE", None)
+            os.remove(first)
+            assert dlp.find_lddec() == second, "首选位置没了要能退到下一个"
+    finally:
+        if original_env is None:
+            os.environ.pop("WM_LDDEC_EXE", None)
+        else:
+            os.environ["WM_LDDEC_EXE"] = original_env
+        dlp.app_dir = original_app_dir
+
+
+def test_dlp_lddec_calls_only_a_copy_and_never_a_directory():
+    """LDDec 适配器：只把**临时副本**交给 dec.exe，且绝不传目录。
+
+    dec.exe 的真实语义是「写 <file>.dec_ → 删除原文件 → 改名覆盖」，所以把副本
+    交给它是唯一能保住原文件的做法；而目录模式会把它目录下所有加密文件都解密
+    覆盖，必须永远不触发。
+    """
+    import subprocess as _sp
+
+    previous = dlp.get_provider()
+    original_run = dlp.subprocess.run
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _png_bytes((36, 24))
+            secret = _write_encrypted(os.path.join(tmp, "secret.png"), payload)
+            deployed = os.path.join(tmp, "LDDec")
+            os.makedirs(deployed)
+            exe = os.path.join(deployed, "dec.exe")
+            with open(exe, "wb") as handle:
+                handle.write(b"fake")
+            with open(os.path.join(deployed, "config.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"port": 34500, "faker": "notepad.exe"}')
+
+            seen = {}
+
+            def _fake_run(argv, **kwargs):
+                seen["argv"] = list(argv)
+                seen["cwd"] = kwargs.get("cwd")
+                target = argv[1]
+                assert os.path.isfile(target), "只接受**文件**，绝不能传目录"
+                with open(target, "rb") as handle:
+                    data = handle.read()
+                assert data[:3] == MAGIC, "交给 dec.exe 的应是密文副本"
+                staged = target + ".dec_"
+                with open(staged, "wb") as handle:
+                    handle.write(data[3:])
+                os.remove(target)          # LDDec 真实行为：删除 + 改名覆盖
+                os.rename(staged, target)
+                return _sp.CompletedProcess(argv, 0, b"", b"")
+
+            dlp.subprocess.run = _fake_run
+            provider = dlp.LddecProvider(exe, timeout=30)
+            dst = dlp.new_plaintext_path(secret)
+            try:
+                provider.decrypt(secret, dst)
+            finally:
+                pass
+
+            assert seen["argv"][0] == exe
+            assert os.path.basename(seen["argv"][1]).startswith("s"), \
+                "交给 dec.exe 的必须是随机名副本，不是原文件"
+            assert seen["argv"][1] != secret, "绝不能把原文件直接交给 dec.exe"
+            assert seen["cwd"] == deployed, "cwd 应是 dec.exe 所在目录"
+            with open(dst, "rb") as handle:
+                assert handle.read() == payload, "应接管就地覆盖后的明文"
+            with open(secret, "rb") as handle:
+                assert handle.read() == MAGIC + payload, "原文件必须保持密文"
+            dlp.release(dst)
+    finally:
+        dlp.subprocess.run = original_run
+        dlp.set_provider(previous)
+
+
+def test_dlp_lddec_cmd_edition_works_without_config_json():
+    """cmd 版（WinDec）不需要 config.json —— 缺了它也必须照常调用。
+
+    仓库里提交的那份 dec.exe 就是 cmd 版（用 ``cmd /c type`` 读文件，没有 TCP /
+    Faker / config.json）。曾经按「TCP 版」的契约做了前置检查，会把只放了一个
+    dec.exe 的机器误判成不可用 —— 这条用例锁住这个回归。
+    """
+    import subprocess as _sp
+
+    previous = dlp.get_provider()
+    original_run = dlp.subprocess.run
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _png_bytes((32, 24))
+            secret = _write_encrypted(os.path.join(tmp, "secret.png"), payload)
+            deployed = os.path.join(tmp, "LDDec")
+            os.makedirs(deployed)
+            exe = os.path.join(deployed, "dec.exe")
+            with open(exe, "wb") as handle:
+                handle.write(b"fake")
+            assert not os.path.exists(os.path.join(deployed, "config.json"))
+
+            def _fake_run(argv, **kwargs):
+                # cmd 版：产物 <file>_dec → 删除原文件 → 改名覆盖
+                target = argv[1]
+                with open(target, "rb") as handle:
+                    data = handle.read()
+                staged = target + "_dec"
+                with open(staged, "wb") as handle:
+                    handle.write(data[3:])
+                os.remove(target)
+                os.rename(staged, target)
+                return _sp.CompletedProcess(argv, 0, b"", b"")
+
+            dlp.subprocess.run = _fake_run
+            provider = dlp.LddecProvider(exe, timeout=30)
+            dst = dlp.new_plaintext_path(secret)
+            try:
+                provider.decrypt(secret, dst)
+                with open(dst, "rb") as handle:
+                    assert handle.read() == payload, "cmd 版无 config.json 也要能出明文"
+            finally:
+                dlp.release(dst)
+            with open(secret, "rb") as handle:
+                assert handle.read() == MAGIC + payload, "原文件仍是密文"
+    finally:
+        dlp.subprocess.run = original_run
+        dlp.set_provider(previous)
+
+
+def test_dlp_lddec_exit_code_minus_one_points_at_config_json_and_port():
+    """退出码 -1（TCP 版拉不起 Faker）要给出可行动的原因，而不是干巴巴的退出码。"""
+    import subprocess as _sp
+
+    previous = dlp.get_provider()
+    original_run = dlp.subprocess.run
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            deployed = os.path.join(tmp, "LDDec")
+            os.makedirs(deployed)
+            exe = os.path.join(deployed, "dec.exe")
+            with open(exe, "wb") as handle:
+                handle.write(b"fake")
+            dlp.subprocess.run = lambda argv, **kw: _sp.CompletedProcess(
+                argv, 4294967295, b"", b"No client connected.")
+            provider = dlp.LddecProvider(exe, timeout=30)
+            secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+            try:
+                provider.decrypt(secret, dlp.new_plaintext_path(secret))
+            except dlp.DecryptError as exc:
+                text = str(exc)
+                assert "Faker" in text or "config.json" in text, text
+            else:
+                raise AssertionError("退出码 -1 必须报 DecryptError")
+    finally:
+        dlp.subprocess.run = original_run
+        dlp.set_provider(previous)
 
 
 def test_dlp_batch_reads_plaintext_but_names_output_from_source():

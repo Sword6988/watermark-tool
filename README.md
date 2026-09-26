@@ -306,8 +306,12 @@ python _smoke/verify_onefile.py dist/WatermarkTool/WatermarkTool.exe   # 目录�
 ## 十一、加密文件（DLP / 透明加密）自动解密
 
 内网加密软件（如天锐绿盾）把文件以密文写在磁盘上，直接解析必然失败。工具内置一层
-**解密适配层**（`wm/dlp.py`）：文件在**进入列表之前**就被换成"可读的明文路径"，
+**解密适配层**（`wm/dlp.py`），并**内置了 LDDec 的调用适配器**
+（`wm.dlp.LddecProvider`）：文件在**进入列表之前**就被换成"可读的明文路径"，
 预览、渲染、批处理整条链路都不知道加密这件事。
+
+> **LDDec 已内置**：只要程序目录下能找到 `dec.exe`，添加加密文件时就会**自动调用**，
+> 无需任何配置。部署方式见下文「部署 LDDec」。
 
 ### 触发时机（只有一处）
 
@@ -333,17 +337,51 @@ python _smoke/verify_onefile.py dist/WatermarkTool/WatermarkTool.exe   # 目录�
 批量时失败只影响它自己：其余文件照常进列表，失败项在**一个**汇总框里逐条列出，
 不会循环弹框把界面堵死。
 
-### 配置解密器（管理员；`wm/dlp.py` 不内置任何第三方工具）
+### 部署 LDDec（内置通道，零配置）
+
+LDDec 有**两套**实现，二进制都叫 `dec.exe`，命令行用法相同（`dec.exe <文件或目录>`），
+适配层两者都支持：
+
+| | TCP 版（`Dec/`） | cmd 版（`WinDec/`）——**仓库里提交的那份就是它** |
+|---|---|---|
+| 机制 | 起 TCP server + Faker 进程读文件 | `cmd /c type "文件" > "文件_dec"` |
+| 同目录 `config.json` | **必需**（`port` + `faker`） | 不需要 |
+| 依赖 | Qt 运行库 | 无 |
+| 产物 | `<file>.dec_` → 覆盖 | `<file>_dec` → 覆盖 |
+
+两者共同点（也是适配层真正依赖的契约）：自己判断头 3 字节是否加密；产物都是
+**先落临时文件再 `remove + rename` 就地覆盖**；单文件模式不打任何输出。
+
+**部署**（把已审计的 LDDec 拷贝进来，`dec.exe` 与它的伴生文件必须**整目录**拷贝）：
+
+```
+python packaging/deploy_lddec.py --from D:\Tools\LDDec    # 从已有目录
+python packaging/deploy_lddec.py --from D:\Tools\dec.exe  # 只给一个 exe 也行
+python packaging/deploy_lddec.py --check                  # 检查是否已被识别
+```
+
+它会被放到 `tools/LDDec/`，启动后状态栏显示「已启用解密通道：LDDec（dec.exe）」；
+打包时该目录会**原样收进** exe（冻结后落在 `sys._MEIPASS/tools/LDDec/`）。
+
+> 仓库**不自带** `dec.exe`：它是第三方预编译二进制（未经审计，且 TCP 版还依赖 Qt
+> 运行库），不适合盲发到内网；`config.json` 里的 `faker` 进程名属于贵司信息安全
+> 策略，应由管理员决定。请用上面的脚本从贵司已部署/已编译的版本拷贝。
+
+### 其它配置项（可选）
 
 | 环境变量 | 含义 |
 |---|---|
-| `WM_DLP_DECRYPT_CMD` | 解密命令模板，如 `"C:\Tools\dec.exe" "{src}" "{dst}"`；**不填 = 没有解密器** |
-| `WM_DLP_ENABLE` | `0` / `off` 一键关停（保留命令配置） |
-| `WM_DLP_TIMEOUT` | 单文件解密超时秒数（默认 30） |
+| `WM_LDDEC_EXE` | 显式指定 dec.exe 路径（或其所在目录），优先级高于自动搜索 |
+| `WM_DLP_ENABLE` | `0` / `off` 一键关停整个解密通道 |
+| `WM_DLP_DECRYPT_CMD` | 想接**别的**解密器时用，命令模板如 `"…{src}" "{dst}"` |
+| `WM_DLP_TIMEOUT` | 单文件解密超时秒数（默认 30；LDDec 通道 60） |
 | `WM_DLP_MAGIC` | 加密魔数（十六进制，默认 `88 7d 1c`） |
 
-模板里的 `{src}` 是**临时目录中的密文副本**，不是原文件 —— 所以即便解密器是"就地
-覆盖"语义（LDDec 的 `dec.exe` 正是如此），被覆盖的也只是一份副本。
+自动搜索顺序：`WM_LDDEC_EXE` → 程序目录下 `LDDec/`、`tools/LDDec/`、程序目录本身、
+`tools/lddec/`。
+
+**无论哪种解密器，交给它的永远是临时目录里的密文副本，不是原文件** —— 所以"就地
+覆盖"语义（LDDec 正是如此）覆盖的也只会是一份副本。
 
 ### 四条铁律
 
@@ -359,6 +397,10 @@ python _smoke/verify_onefile.py dist/WatermarkTool/WatermarkTool.exe   # 目录�
 
 ### 相关测试
 
-`tests/test_dlp.py`（11 条）：魔数探测、未加密零开销、明文内容正确、原文件不被
+`tests/test_dlp.py`（16 条）：魔数探测、未加密零开销、明文内容正确、原文件不被
 改写、按钮与拖拽同一条链路、失败 / 损坏只跳过自己、明文清理、外部命令不碰原文件、
-批处理读明文但按原文件命名。
+批处理读明文但按原文件命名，以及 LDDec 专属：自动发现与优先级、只交副本不交目录、
+cmd 版无 config.json 也要能跑、退出码 -1 的错误可行动。
+
+真实 `dec.exe` 的端到端冒烟已在本机跑过（无绿盾环境）：调用成功、接管就地覆盖产物、
+校验判为"仍是密文"并给出准确提示、**原文件字节不变**、明文目录无残留。

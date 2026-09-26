@@ -91,6 +91,8 @@ class App:
         self._build_ui()
         self._install_lifecycle_hooks()
         self.panel.load_families()
+        # 先报解密通道（低优先级），再报拖拽状态 —— 后者不可用是要紧事，不能被覆盖
+        self._report_dlp_state()
         self._setup_dnd()
         self.preview.show_placeholder("empty", "把文件拖到这里，或点击「选择文件」")
         self._poll_job = self.root.after(_POLL_MS, self._poll_results)
@@ -310,6 +312,23 @@ class App:
         else:
             text = f"拖拽部分区域不可用（{self.dnd_note}），也可点「选择文件」"
         self._set_status(text, T.WARN)
+
+    def _report_dlp_state(self) -> None:
+        """启动时把「解密通道」写一次状态栏（**不**弹框）。
+
+        加密文件能不能处理，完全取决于本机有没有可用的解密通道，而这件事从界面上
+        看不出来。启用时给一句确认，让用户知道"放进去的 dec.exe 已被识别"；
+        **没启用时保持沉默** —— 绝大多数机器没有加密软件，每次启动都提示是噪音。
+        """
+        try:
+            provider = dlp.get_provider()
+        except Exception:
+            return  # 探测失败就当没有解密通道，绝不能因此阻断启动
+        if provider is None:
+            return
+        describe = getattr(provider, "describe", None)
+        label = describe() if callable(describe) else getattr(provider, "name", "解密组件")
+        self._set_status(f"已启用解密通道：{label}", T.TEXT_DIM)
 
     def _set_status(self, text: str, color: str = T.TEXT_DIM) -> None:
         """写状态栏；控件已随 root 销毁（关窗竞态）时忽略。"""

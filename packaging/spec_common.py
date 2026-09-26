@@ -29,7 +29,7 @@ def _detect_version() -> str:
     try:
         from wm import __version__ as _version
     except Exception:
-        return "1.0.3"
+        return "1.0.4"
     return str(_version)
 
 
@@ -105,6 +105,22 @@ def collect_assets():
             raise SystemExit("[FAIL] 缺少图标资产: %s（先跑 packaging/make_icon.py）" % full)
         datas.append((full, "assets"))
     print("[OK] 收集图标: assets/app.ico + assets/app_256.png")
+
+    # LDDec 解密通道（**可选**）：把 tools/LDDec/ 整个目录原样收进包，冻结后落在
+    # sys._MEIPASS/tools/LDDec/ —— wm.dlp.find_lddec() 正是去那里找 dec.exe。
+    # dec.exe 用 QCoreApplication::applicationDirPath() 定位同目录的 config.json
+    # 与 Faker 进程，所以**必须整目录收集**，只拷一个 exe 是跑不起来的。
+    # 没部署就静默跳过：绝大多数机器没有加密软件，不能因此构建失败。
+    lddec_dir = os.path.join(PROJECT_ROOT, "tools", "LDDec")
+    if os.path.isdir(lddec_dir):
+        picked = []
+        for name in sorted(os.listdir(lddec_dir)):
+            full = os.path.join(lddec_dir, name)
+            if os.path.isfile(full):
+                datas.append((full, os.path.join("tools", "LDDec")))
+                picked.append(name)
+        if picked:
+            print("[OK] 收集 LDDec: tools/LDDec -> %s" % picked)
     return datas, binaries
 
 
