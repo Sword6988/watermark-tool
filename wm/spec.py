@@ -132,7 +132,9 @@ def to_float(value: Any, default: float = 0.0) -> float:
         result = float(value)
     except (TypeError, ValueError):
         return float(default)
-    if result != result:  # NaN
+    # NaN 与 ±inf 都要挡：模块自称「任何非法值都不抛异常」，而 inf 会一路活到
+    # ``math.fmod(inf, 360)`` 抛 ValueError，让 normalized() 自己破例。
+    if result != result or result in (float("inf"), float("-inf")):
         return float(default)
     return result
 
@@ -194,7 +196,9 @@ class WatermarkSpec:
         txt = self.text if isinstance(self.text, str) else ""
         if not txt.strip():
             txt = DEFAULT_TEXT
-        return txt.split("\n")
+        # splitlines() 而不是 split("\n")：CRLF 文本（Windows 剪贴板粘贴很常见）
+        # 否则会把 ``\r`` 留在行尾，一个看不见的字符参与块宽计算。
+        return txt.splitlines() or [txt]
 
     def copy(self, **changes: Any) -> "WatermarkSpec":
         """返回替换若干字段后的新对象（不修改自身）。"""
@@ -233,7 +237,9 @@ class WatermarkSpec:
             self.font_family,
             round(float(self.angle), 4),
             round(float(self.opacity), 6),
-            self.color,
+            # 颜色进 key 前先归一化：``#D32F2F`` 与 ``#d32f2f`` 像素完全相同，
+            # 未归一化时却是两条缓存记录（各存一份整页图层 / 块位图）。
+            normalize_color(self.color),
         )
 
     def render_key(self) -> Tuple[Any, ...]:
@@ -250,7 +256,9 @@ class WatermarkSpec:
             round(float(self.margin_pct), 4),
             round(float(self.angle), 4),
             round(float(self.opacity), 6),
-            self.color,
+            # 颜色进 key 前先归一化：``#D32F2F`` 与 ``#d32f2f`` 像素完全相同，
+            # 未归一化时却是两条缓存记录（各存一份整页图层 / 块位图）。
+            normalize_color(self.color),
         )
 
     # -- 序列化 -----------------------------------------------------------

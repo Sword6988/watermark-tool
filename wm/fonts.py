@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 from PIL import ImageFont
 
+from .lru import SizedLRU
+
 #: 界面与渲染的字体优先列表。
 #:
 #: **微软雅黑排在最前**：它是 Windows 自带字体，绝大多数机器都有；鸿蒙黑体
@@ -133,17 +135,47 @@ _FONT_EXTS: Tuple[str, ...] = (".ttf", ".ttc", ".otf")
 _family_map: Optional[Dict[str, Tuple[str, int]]] = None
 _scan_lock = threading.Lock()
 
-#: 家族名 -> 是否真有汉字字形（``can_render_cjk`` 的缓存）
-_cjk_map: Dict[str, bool] = {}
+_warned: set = set()
+_warn_lock = threading.Lock()
+
+
+def _warn_once(message: str) -> None:
+    """同一条诊断只报一次（字体问题会在每次取字体时重复触发）。"""
+    with _warn_lock:
+        if message in _warned:
+            return
+        _warned.add(message)
+    try:
+        import sys
+        print("[WARN][fonts] " + message, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _unit_cost(_value: object) -> int:
+    """按**条数**计费（字体对象与布尔标记都不好估字节，条目数限流即可）。"""
+    return 1
+
+
+#: 家族名 -> 是否真有汉字字形（``can_render_cjk`` 的缓存）。
+#: 用 :class:`wm.lru.SizedLRU`：自带 RLock，UI 线程与预览线程并发读写安全；
+#: 且是**真 LRU** —— 旧做法到 128 条就整表清空，命中率悬崖式抖动。
+_cjk_map: "SizedLRU[str, bool]" = SizedLRU(_unit_cost, lambda: _CJK_MAP_CAP, min_keep=0)
 
 #: 「能不能排中文」的探针字，以及用来逼出 ``.notdef`` 的对照字。
 #: U+FFFF 是**永久非字符**，任何字体都没有它的字形，必然落到 .notdef。
 _CJK_SAMPLE = "中"
 _NODEF_SAMPLE = "\uFFFF"
 
-#: PIL 字体对象缓存 (family, px) -> FreeTypeFont
-_font_cache: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
+#: PIL 字体对象缓存 (family, px) -> FreeTypeFont。
+#: 同样用 SizedLRU（带锁 + 真 LRU），替代「裸 dict + 到 128 条整体清空」——
+#: 后者既无锁（多线程写 dict 结构）又会周期性把缓存抖空。
+_font_cache: "SizedLRU[Tuple[str, int], ImageFont.FreeTypeFont]" = SizedLRU(
+    _unit_cost, lambda: _FONT_CACHE_CAP, min_keep=0)
 _FONT_CACHE_CAP = 128
+
+#: 中文覆盖判定缓存的条目上限（字体家族数量级，给足即可）
+_CJK_MAP_CAP = 512
 
 
 def _scan_fonts() -> Dict[str, Tuple[str, int]]:
@@ -224,7 +256,7 @@ def can_render_cjk(family: Optional[str]) -> bool:
                           != bytes(probe.getmask(_NODEF_SAMPLE)))
     except Exception:
         result = False
-    _cjk_map[family] = result
+    _cjk_map.set(family, result)
     return result
 
 
@@ -301,9 +333,18 @@ def resolve(family: Optional[str]) -> Optional[Tuple[str, int]]:
         hit = mapping.get(fam)
         if hit is not None:
             return hit
-    if mapping:
-        return next(iter(mapping.values()))
-    return None
+    if not mapping:
+        return None
+    # 末档不再是「任意第一个字体」：若它恰好是 Wingdings / Webdings 之类符号字体，
+    # 中文会整片变成空白或豆腐块，而渲染层看不出来（bbox 为空只回退成整块尺寸），
+    # 用户只能看到「水印没了」—— 且**没有任何提示**。
+    for fam in mapping:
+        if can_render_cjk(fam):
+            return mapping[fam]
+    fallback = next(iter(mapping.values()))
+    _warn_once("没有能排中文的字体，已回退到 %s；"
+               "中文水印可能显示为空白或方框" % next(iter(mapping)))
+    return fallback
 
 
 def has_family(family: Optional[str]) -> bool:
@@ -334,14 +375,16 @@ def pil_font(family: Optional[str], size: float) -> ImageFont.FreeTypeFont:
         except Exception:
             font = None
     if font is None:
+        # load_default 的 Aileron **没有 CJK 字形**：走到这里说明连字体文件都没
+        # 解析成功，中文必然排不出来 —— 必须留痕，否则用户只看到「水印没了」。
+        _warn_once("字体 %r 无法加载，已回退到 PIL 默认字体（不含中文字形）"
+                   % (family or ""))
         try:
             font = ImageFont.load_default(size=px)
         except Exception:
             font = ImageFont.load_default()
 
-    if len(_font_cache) >= _FONT_CACHE_CAP:
-        _font_cache.clear()
-    _font_cache[key] = font
+    _font_cache.set(key, font)
     return font
 
 

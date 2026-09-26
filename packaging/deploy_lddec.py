@@ -21,10 +21,12 @@ LDDec 的**运行文件**放到工具认得的位置。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import sys
+import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEST = os.path.join(PROJECT_ROOT, "tools", "LDDec")
@@ -36,6 +38,66 @@ if PROJECT_ROOT not in sys.path:
 #: dec.exe 运行必需 / 常见的伴生文件（源码 ``Common/Setting.cpp`` 与
 #: ``Dec/main_dec.cpp`` 决定：同目录必须有 config.json，且要能启动 Faker 进程）
 DEFAULT_CONFIG = {"port": 34500, "faker": "notepad.exe"}
+
+#: 记录二进制的**来源与指纹**（供应链可追溯）：本文件自己主张「需审计」，
+#: 那就必须留下可核对的东西 —— 否则"审计过"只是口头说法。
+MANIFEST = "SHA256.txt"
+
+
+def sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_manifest(directory: str, source: str) -> None:
+    """把每个文件的 SHA256 与来源写进 ``SHA256.txt``。"""
+    lines = [
+        "# LDDec 运行文件指纹（由 packaging/deploy_lddec.py 生成）",
+        "# 用途：换机器 / 换版本后能核对文件是否被替换，满足供应链可追溯要求",
+        "# 来源：%s" % (source or "未知"),
+        "# 生成时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+    ]
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path) or name == MANIFEST:
+            continue
+        lines.append("%s  %s" % (sha256(path), name))
+    with open(os.path.join(directory, MANIFEST), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def verify_manifest(directory: str) -> bool:
+    """核对目录里的文件与 ``SHA256.txt`` 是否一致；没有清单返回 True。"""
+    path = os.path.join(directory, MANIFEST)
+    if not os.path.isfile(path):
+        return True
+    expected = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                expected[parts[1]] = parts[0]
+    bad = []
+    for name, want in expected.items():
+        target = os.path.join(directory, name)
+        if not os.path.isfile(target):
+            bad.append("%s（缺失）" % name)
+            continue
+        if sha256(target) != want:
+            bad.append(name)
+    if bad:
+        print("[FAIL] 以下文件与 %s 记录不符（可能被替换或损坏）：%s"
+              % (MANIFEST, "、".join(bad)))
+        return False
+    print("[OK] 全部文件与 %s 一致（%d 个）" % (MANIFEST, len(expected)))
+    return True
 
 
 def _is_runtime_file(name: str) -> bool:
@@ -100,6 +162,10 @@ def deploy(source: str, force: bool = False) -> int:
         return 1
     print("[OK] dec.exe 就位")
 
+    write_manifest(DEST, os.path.abspath(source))
+    print("[OK] 已写入指纹清单 %s（来源：%s）"
+          % (os.path.join(DEST, MANIFEST), os.path.abspath(source)))
+
     if not any(n.lower().endswith(".exe") and n.lower() != "dec.exe" for n in copied):
         print("[WARN] 目录里只有 dec.exe，没有 Faker 进程（config.json 的 faker 字段"
               "指向的那个可执行文件）。缺了它 dec.exe 会报「Faker 进程没能连上」。")
@@ -120,7 +186,9 @@ def check() -> int:
     if not exe:
         print("[--] 未找到 dec.exe -> 解密通道不会启用（不会影响普通文件）")
         return 1
-    print("[OK] 找到 dec.exe:", exe)
+    print("[OK] 找到 dec.exe:", exe, "（SHA256 %s…）" % sha256(exe)[:16])
+    if not verify_manifest(os.path.dirname(exe)):
+        return 1
     config = os.path.join(os.path.dirname(exe), "config.json")
     if os.path.isfile(config):
         try:
@@ -129,8 +197,12 @@ def check() -> int:
         except Exception as exc:
             print(f"[WARN] config.json 读不出来：{exc}")
     else:
-        print("[FAIL] 缺少 config.json -> dec.exe 无法启动读取进程")
-        return 1
+        # 不能判成失败：只有 **TCP 版**（Dec/，需要 Faker 进程）才读 config.json，
+        # 而随包分发的是 **cmd 版**（WinDec/，用 `cmd /c type`），压根不看它。
+        # 早先这里一律 [FAIL] + 返回 1，会让"检查随包部署"永远显示失败，
+        # 把真正该看的信号（dec.exe 找没找到、指纹对不对）淹掉。
+        print("[--] 没有 config.json：cmd 版（WinDec）不需要它；"
+              "若你部署的是 TCP 版，则必须补上（含 port 与 faker）")
     provider = dlp.LddecProvider(exe)
     print("[OK] 解密通道可用:", provider.describe(),
           f"（超时 {provider.timeout:.0f}s，TCP {dlp.LDDEC_PORT}）")

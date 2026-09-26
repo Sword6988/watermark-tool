@@ -43,7 +43,7 @@ import time
 from typing import Callable, Optional, Tuple
 
 import pymupdf as fitz  # PyMuPDF（``import fitz`` 自 1.28 起已弃用，将来会 ImportError）
-from PIL import Image
+from PIL import Image, ImageChops
 
 from . import layout
 from .lru import SizedLRU
@@ -66,6 +66,12 @@ IMAGE_RENDER_SCALE = 2.0
 IMAGE_SS_MAX_PIXELS = 8_000_000
 #: 图片路径超过此像素数（目标尺寸）就按「水平带」合成，避免整层 RGBA 驻留。
 IMAGE_BAND_PIXELS = 16_000_000
+
+#: 预览水印层的**像素预算**。预览最终只显示画布大小（通常几百到一千像素），
+#: 但水印层若按页面 1:1 光栅化，超大页（8000×8000 = 64MP）会直接吃掉 256MB
+#: RGBA —— 两三条预览帧叠加就顶到 1GB。超过预算就降光栅倍率（见
+#: :func:`preview_layer_scale`），版式不受影响。
+PREVIEW_SS_MAX_PIXELS = 16_000_000
 #: 每条带的行数；峰值内存 ≈ 带宽 × 宽 × 4 字节。
 IMAGE_BAND_ROWS = 1024
 #: **PDF** 路径的光栅倍率（72 dpi * 2 = 144 dpi）。打印需要更高分辨率，保留 2×。
@@ -117,7 +123,9 @@ def pdf_render_scale(page_w: float, page_h: float, scale: float = PDF_RENDER_SCA
     """
     base = max(PDF_MIN_RENDER_SCALE, float(scale))
     area = float(page_w) * float(page_h)
-    if area <= 0:
+    # ``area <= 0`` 挡不住 NaN（NaN 的任何比较都是 False），后面
+    # ``int(math.floor(...))`` 会把 NaN 变成 ValueError。非有限值直接按 base 返回。
+    if not math.isfinite(area) or area <= 0:
         return base
     affordable = math.sqrt(PDF_SS_MAX_PIXELS / area)
     if affordable >= base:
@@ -198,7 +206,7 @@ def _prepare_layer(
     # 必须裁+拉伸而不能只按「缩放块自身 bbox」对齐：FreeType 的字形外接框并非严格线性
     # 缩放（实测 A4 font4%：原生 ink 宽 89 → 2× 实际 174 ≠ 178），只对齐一条边会让对面
     # 边漂移约 2pt，破坏「贴边 ≤2px」。裁到 ink 后拉伸到 round(ink*scale)，两条边都精确。
-    block = layout._render_block_bitmap(spec, size * scale)
+    block = layout.render_block_bitmap(spec, size * scale)
     check()  # 块位图渲染可能是**最贵**的一步（实测单块可达 4.73s）
     bbox = block.getchannel("A").getbbox()
     ink_block = block.crop(bbox) if bbox else block
@@ -307,13 +315,60 @@ def render_overlay_layer(
     scale = max(1e-3, float(scale))
     layer_w = max(1, int(round(page_w * scale)))
     layer_h = max(1, int(round(page_h * scale)))
-    if page_w <= 0 or page_h <= 0:
+    if not (math.isfinite(page_w) and math.isfinite(page_h)) or page_w <= 0 or page_h <= 0:
         return Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
 
-    native = _render_crisp_layer(page_w, page_h, spec, 1.0, is_cancelled=is_cancelled)
+    # **预览也必须有尺寸上限**（输出路径有 IMAGE_BAND_PIXELS / IMAGE_SS_MAX_PIXELS
+    # 两道闸，预览路径原本一道都没有）：8000×8000 的页、画布只有 1000px，却仍按
+    # 1:1 分配 256MB RGBA 层再降采样 —— 单帧峰值可达 ~1GB 且进入后无法取消。
+    #
+    # 这里按像素预算把**光栅倍率**压下来（版式恒在原生坐标系算，不受影响）：
+    # 块位图因此更小，最终再缩放到目标尺寸。极端大幅面下字形密度与「1:1 再缩」
+    # 会有细微差别，但那是「卡死 / 被系统杀进程」与「边缘略柔」之间的取舍。
+    native_scale = min(1.0, preview_layer_scale(page_w, page_h))
+    native = _render_crisp_layer(page_w, page_h, spec, native_scale,
+                                 is_cancelled=is_cancelled)
     if native.size == (layer_w, layer_h):
         return native
     return native.resize((layer_w, layer_h), Image.LANCZOS)
+
+
+def _layer_to_pixmap(layer: Image.Image):
+    """把 RGBA 水印层转成 ``fitz.Pixmap``（**不做 PNG 编解码往返**）。
+
+    早先是 ``layer.save(PNG)`` → ``fitz.Pixmap(png_bytes)``：每遇一个新页面尺寸
+    就要付一次全页 encode + decode（A0 幅面是几十 MB 的压缩/解压），而这一步
+    在缓存未命中时每次都付。PyMuPDF 支持直接用 RGBA 采样构造 Pixmap，省掉整个
+    往返。构造失败（版本差异 / 尺寸异常）时回退到 PNG 路径 —— 多花一点时间，
+    也好过让整页没水印。
+
+    ⚠️ 必须**预乘 alpha**：MuPDF 的带 alpha Pixmap 存的就是预乘值（PNG 解码器
+    也是这么给的，实测同一张图 PNG 路径得到 (106,24,24) 而非 (211,47,47)）。
+    不预乘会让半透明水印颜色偏深、与图片路径不再一致。
+    """
+    try:
+        alpha = layer.getchannel("A")
+        red, green, blue = layer.convert("RGB").split()
+        premultiplied = Image.merge(
+            "RGBA", (ImageChops.multiply(red, alpha),
+                     ImageChops.multiply(green, alpha),
+                     ImageChops.multiply(blue, alpha), alpha))
+        return fitz.Pixmap(fitz.csRGB, layer.width, layer.height,
+                           premultiplied.tobytes(), True)
+    except Exception:
+        buffer = io.BytesIO()
+        layer.save(buffer, format="PNG")
+        return fitz.Pixmap(buffer.getvalue())  # n=4, alpha=1（保留 alpha）
+
+
+def preview_layer_scale(page_w: float, page_h: float) -> float:
+    """预览用的水印层光栅倍率：把整层像素压进 :data:`PREVIEW_SS_MAX_PIXELS`。"""
+    area = float(page_w) * float(page_h)
+    if not math.isfinite(area) or area <= 0:
+        return 1.0
+    if area <= PREVIEW_SS_MAX_PIXELS:
+        return 1.0
+    return max(1e-3, math.sqrt(PREVIEW_SS_MAX_PIXELS / area))
 
 
 def render_output_layer(
@@ -525,9 +580,7 @@ def render_pdf(
                     # 「四段覆盖率」测不出来：平铺图案转 180° 照样铺满整页。判方向必须
                     # 用非对称标记（见 ``_smoke/verify_rotate_marker.py``）。
                     layer = layer.rotate(rot, expand=True)
-                buffer = io.BytesIO()
-                layer.save(buffer, format="PNG")
-                pix = fitz.Pixmap(buffer.getvalue())  # n=4, alpha=1（保留 alpha）
+                pix = _layer_to_pixmap(layer)
                 # 单条超预算时 SizedLRU 自动拒收（否则一进去就把缓存清光，
                 # 反复重渲染）；普通过则由它按字节预算淘汰最旧的一条。
                 _PDF_LAYER_CACHE.set(key, pix)
@@ -540,7 +593,10 @@ def render_pdf(
                     page.set_rotation(rot)
             if progress is not None:
                 progress(index + 1, total, f"第 {index + 1}/{total} 页")
-            time.sleep(0.001)  # Windows 上必须给足 1ms 才能让主线程拿到 GIL
+            # 每 32 页让出一次 GIL 即可（原本每页 1ms：1000 页凭空多花 1 秒）。
+            # 让出的目的只是让主线程能刷新进度，不需要每页都让。
+            if index % 32 == 31:
+                time.sleep(0.001)
         # 直接流式写盘，不再 tobytes() 整份驻留内存；写坏/中断只影响 .part
         doc.save(part_path, garbage=4, deflate=True)
     except BaseException:

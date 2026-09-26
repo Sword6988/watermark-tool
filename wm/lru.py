@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from typing import Callable, Generic, Iterator, Optional, Tuple, TypeVar
+from typing import Callable, Generic, Iterator, Optional, Tuple, TypeVar, Union
 
 Key = TypeVar("Key")
 Value = TypeVar("Value")
 
-#: 预算类型：固定字节数，或「每次需要时才求值」的无参函数（见模块 docstring 第 3 点）
-Budget = int
+#: 预算类型：固定字节数，或「每次需要时才求值」的无参函数（见模块 docstring 第 3 点）。
+#: 写成 Union 而非裸 ``int`` —— 后者会让人误以为只能传数字，与实现不符。
+Budget = Union[int, Callable[[], int]]
 
 
 class SizedLRU(Generic[Key, Value]):

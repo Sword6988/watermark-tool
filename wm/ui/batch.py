@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Callable, List, Optional
 
-from .. import media, render
+from .. import dlp, media, render
 from ..spec import DEFAULT_SUFFIX, WatermarkSpec
 from . import output
 
@@ -58,44 +58,55 @@ def run_batch(
     total = len(files)
     succeeded = 0
     failed: "list" = []
-    for index, path in enumerate(files):
-        if is_cancelled():
-            break
-        src = read_path(path) if read_path is not None else path
-        try:
-            doc = media.Document(path, read_path=src)
+    # ``on_done`` 是界面解除 busy / 恢复按钮的**唯一**信号，必须送达：
+    # 循环体里任何一处漏掉的异常（含回调自身抛错）都会让它永不入队，界面就永久
+    # 停在「处理中」、按钮全灰。因此整段包 try/finally，break 与异常都照常收尾。
+    try:
+        for index, path in enumerate(files):
+            if is_cancelled():
+                break
+            src = read_path(path) if read_path is not None else path
             try:
-                dst = media.plan_output(path, out_dir, suffix=suffix)
-                if doc.kind == media.KIND_PDF:
-                    pages = render.render_pdf(
-                        src, dst, spec,
-                        progress=lambda done, count, label, i=index: on_progress(
-                            done, count, label, i),
-                        is_cancelled=is_cancelled)
-                    note = f"{pages} 页"
-                else:
-                    out = render.render_image(doc.page_image(0), spec)
-                    # 元数据（EXIF / DPI / ICC）由 media.Document 提供，缺失为 None；
-                    # 用 getattr 兼容对方尚未落地的版本，属性缺失就按无该项存。
-                    output.save_image(
-                        out, dst,
-                        exif=getattr(doc, "exif_bytes", None),
-                        dpi=getattr(doc, "dpi", None),
-                        icc_profile=getattr(doc, "icc_profile", None))
-                    note = (f"仅首帧（共 {doc.frame_count} 帧）" if doc.frame_count > 1
-                            else "图片")
-            finally:
-                doc.close()
-            succeeded += 1
-            on_log(f"[OK] {os.path.basename(path)} -> {os.path.basename(dst)}（{note}）")
-        except render.Cancelled:
-            on_log("[FAIL] 已取消")
-            break
-        except Exception as exc:
-            failed.append((path, str(exc)))
-            on_log(f"[FAIL] {os.path.basename(path)}：{exc}")
-        on_progress(1, 1, "", index)
-    on_done(succeeded, failed, is_cancelled())
+                # 读取前先确认明文还在（M8）：明文是临时目录里的中间产物，可能被
+                # 清理工具 / 杀软删掉或换掉。不校验的话失败只会是 Pillow/PyMuPDF
+                # 抛的一句「无法打开」，与"文件本身损坏"无从区分，也没日志。
+                problem = dlp.plaintext_problem(src)
+                if problem:
+                    raise ValueError(problem)
+                doc = media.Document(path, read_path=src)
+                try:
+                    dst = media.plan_output(path, out_dir, suffix=suffix)
+                    if doc.kind == media.KIND_PDF:
+                        pages = render.render_pdf(
+                            src, dst, spec,
+                            progress=lambda done, count, label, i=index: on_progress(
+                                done, count, label, i),
+                            is_cancelled=is_cancelled)
+                        note = f"{pages} 页"
+                    else:
+                        out = render.render_image(doc.page_image(0), spec)
+                        # 元数据（EXIF / DPI / ICC）由 media.Document 提供，缺失为 None；
+                        # 用 getattr 兼容对方尚未落地的版本，属性缺失就按无该项存。
+                        output.save_image(
+                            out, dst,
+                            exif=getattr(doc, "exif_bytes", None),
+                            dpi=getattr(doc, "dpi", None),
+                            icc_profile=getattr(doc, "icc_profile", None))
+                        note = (f"仅首帧（共 {doc.frame_count} 帧）" if doc.frame_count > 1
+                                else "图片")
+                finally:
+                    doc.close()
+                succeeded += 1
+                on_log(f"[OK] {os.path.basename(path)} -> {os.path.basename(dst)}（{note}）")
+            except render.Cancelled:
+                on_log("[FAIL] 已取消")
+                break
+            except Exception as exc:
+                failed.append((path, str(exc)))
+                on_log(f"[FAIL] {os.path.basename(path)}：{exc}")
+            on_progress(1, 1, "", index)
+    finally:
+        on_done(succeeded, failed, is_cancelled())
 
 
 __all__ = ["run_batch"]

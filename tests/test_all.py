@@ -823,7 +823,7 @@ def test_block_bitmap_rejects_absurd_text():
     absurd = WatermarkSpec(text="A" * 2000, font_pct=30.0).normalized()
     started = time.perf_counter()
     try:
-        layout._render_block_bitmap(absurd, 357.0)
+        layout.render_block_bitmap(absurd, 357.0)
         raise AssertionError("极端文本没有被拦截")
     except ValueError as exc:
         assert "过大" in str(exc), f"报错要给人话，实际：{exc}"
@@ -834,7 +834,7 @@ def test_block_bitmap_rejects_absurd_text():
     # 旋转后却达 247.7MP / 约 945MB RGBA、耗时 2.74s，正是本护栏要消灭的内存炸弹。
     for text, pct in (("机密文件", 30.0), ("内部资料\n请勿外传", 12.0)):
         ok = WatermarkSpec(text=text, font_pct=pct).normalized()
-        bitmap = layout._render_block_bitmap(ok, 178.5)
+        bitmap = layout.render_block_bitmap(ok, 178.5)
         assert bitmap.size[0] > 0 and bitmap.size[1] > 0
 
 
@@ -877,7 +877,7 @@ def test_block_guard_uses_rotated_bounds():
     started = time.perf_counter()
     try:
         try:
-            layout._render_block_bitmap(bomb, 178.5)
+            layout.render_block_bitmap(bomb, 178.5)
             raise AssertionError("247.7MP 的旋转后水印块没有被拦截")
         except ValueError as exc:
             assert "旋转后" in str(exc) and "过大" in str(exc), str(exc)
@@ -897,7 +897,7 @@ def test_render_cache_respects_byte_budget():
     layout.clear_caches()
     try:
         for pct in range(1, 31):
-            layout._render_block_bitmap(
+            layout.render_block_bitmap(
                 WatermarkSpec(font_pct=float(pct)).normalized(), pct * 40.0)
         total = sum(layout._bitmap_cost(v) for v in layout._RENDER_CACHE.values())
         assert total <= layout._RENDER_CACHE_BYTES, \

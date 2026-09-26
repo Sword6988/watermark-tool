@@ -10,20 +10,24 @@
 
 ## 一、运行
 
-必须使用**系统 Python**（WorkBuddy 托管 Python 没有 tkinter）：
+必须使用**系统 Python**（WorkBuddy 托管 Python 没有 tkinter）。下面用
+`<PY>` 代指你的系统 Python 实际路径，例如官方安装器默认是：
 
 ```
-"C:\Users\Shibeng\AppData\Local\Programs\Python\Python314\python.exe" main.py
+set PY="%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
 ```
 
-也可以启动时直接预载文件：
+（若是「为所有用户安装」，则在 `C:\Program Files\Python313\python.exe`。
+全项目统一 **Python 3.13**；换个机器请把 `<PY>` 换成那台机器上的真实路径。）
 
 ```
-"C:\Users\Shibeng\AppData\Local\Programs\Python\Python314\python.exe" main.py a.png b.pdf
+<PY> main.py                 # 打开空窗口
+<PY> main.py a.png b.pdf     # 启动时预载文件
 ```
 
-依赖已全部安装，无需 `pip install`。依赖清单见 `requirements.txt`：
-`Pillow`、`PyMuPDF`、`numpy`（测试用）；`tkinter`（标准库）、`tkinterdnd2`（拖拽）。
+依赖清单见 `requirements.txt`：`Pillow`、`PyMuPDF`、`numpy`（测试用）、
+`tkinterdnd2`（拖拽）、`PyInstaller`（打包用）；`tkinter` 为标准库。
+除打包外，运行本工具**不需要** `pip install`。
 
 ---
 
@@ -174,14 +178,22 @@ watermark-tool/
 ├─ wm/render.py           # 渲染层：输出（_render_crisp_layer / render_output_layer）
 │                         # 与预览（render_overlay_layer）双入口，墨迹锚点摆放
 ├─ wm/media.py            # 类型识别、页面尺寸读取、输出路径规划（不覆盖原文件）
+├─ wm/dlp.py              # 加密文件（DLP / 透明加密）适配层：探测 → 多通道解密 → 明文生命周期
 ├─ wm/ui/__init__.py
 ├─ wm/ui/theme.py         # Win11 Fluent 浅色主题令牌 + 自绘控件套件
 ├─ wm/ui/panel.py         # 参数面板（无平铺开关 / 无位置调节）+ 「恢复默认」
 ├─ wm/ui/preview.py       # 预览画布：fit 缩放、翻页、三态占位（只查看，不拖拽）
 ├─ wm/ui/app.py           # 主窗口装配 + 文件列表 + 批处理 + 进度
-├─ tests/run_all.py       # 不依赖 pytest 的测试运行器
+├─ tests/run_all.py       # 不依赖 pytest 的测试运行器（看门狗 + 跳过汇总）
 ├─ tests/test_all.py      # 工程师测试套件
 ├─ tests/test_qa_independent.py  # QA 独立测试套件（像素级验收护栏）
+├─ tests/test_dlp.py      # 解密适配层（假解密器，不依赖内网）
+├─ tests/test_robustness.py      # 「卡死 / 静默退出」级缺陷回归（P0）
+├─ tests/test_core_units.py      # lru / fonts / panel 单测
+├─ tests/test_entrypoint.py      # 入口参数解析、自检门禁、随包 dec.exe 指纹
+├─ tests/test_ui_units.py / test_stepper.py / test_angle_dial.py / test_banding.py
+├─ packaging/             # 打包与验收脚本（build_onefile / build / deploy_lddec）
+├─ tools/LDDec/           # 随包分发的解密器 + SHA256.txt 指纹
 ├─ requirements.txt
 └─ README.md
 ```
@@ -194,10 +206,13 @@ pytest **未安装**，用自带运行器（pytest 风格的裸 `assert`，可�
 
 ```
 cd watermark-tool
-"C:\Users\Shibeng\AppData\Local\Programs\Python\Python314\python.exe" tests/run_all.py
+<PY> tests/run_all.py
 ```
 
-覆盖：**平铺间隙几何**（`: 同轴所有间隙严格相等` + `可见空隙 ≥ 2×边距` + 首尾贴齐
+> `<PY>` 同上（§一）。运行器自带 30 秒看门狗、按用例复原被改过的模块常量，
+> 并把 `[SKIP]`（零断言）**单独汇总列出** —— 跳过绝不会被算成通过。
+
+当前 **134 条**，分布在 10 个 `test_*.py`（详见 §六）。覆盖：**平铺间隙几何**（`: 同轴所有间隙严格相等` + `可见空隙 ≥ 2×边距` + 首尾贴齐
 页面边距线 + 相邻块**墨迹外接框互不相交**，并对全参数网格做扫描）与 `extra_gap`
 回退路径、图片与 PDF 两路径一致性（595×842，偏差 ≤ 2 px）、PDF 透明度（alpha 保留）、
 参数夹紧（含**旧配置里遗留的 `tile` / `offset_*` 键必须被忽略**）、输出路径不覆盖、
@@ -222,7 +237,8 @@ cd watermark-tool
    最终输出始终是全分辨率的。
 5. 输出图片格式沿用原扩展名；JPEG / BMP / GIF 会压平 alpha（白底）。
    元数据（EXIF / DPI / ICC）按目标格式能力写回：BMP / GIF 没有这些容器，会跳过；
-   任一项写失败也不会让导出失败，只在 `runtime.log` 记一行降级提示。
+   任一项写失败也不会让导出失败，只在 `runtime-<pid>.log` 记一行降级提示
+   （日志在 `%LOCALAPPDATA%\WatermarkTool\logs\`，按进程分文件，只留最近 5 份）。
 6. **PDF 输出的光栅倍率按页面大小自适应**：A4 及以内仍用 2×（144dpi，打印清晰），
    A0 这类巨页自动降到 1× —— 固定 2× 时 A0 单页要 2.44s、体积 +873KB，降倍率后
    回落到 +305KB / 0.6s，而**版式（块数、间距、贴边）完全不变**。
@@ -241,7 +257,7 @@ cd watermark-tool
 
 ```python
 # 在 watermark-tool/ 目录下运行
-import fitz
+import pymupdf as fitz   # 注意：``import fitz`` 自 PyMuPDF 1.28 起已弃用（将来会 ImportError）
 from PIL import Image
 from wm import media, render
 from wm.spec import WatermarkSpec
@@ -276,6 +292,10 @@ render.render_pdf("_smoke/in.pdf", "_smoke/out.pdf", spec)
 | 分发 | 发一个文件即可 | 必须整个文件夹打包，丢掉 `_internal` 就起不来 |
 | 体积 | 32.2 MB（已压缩） | 68.4 MB 展开 / 32.1 MB zip |
 | 冷启动 | ≈1.6 s（每次解压到 `%TEMP%\_MEIxxxxxx`） | ≈0.6 s（直接读 `_internal`） |
+
+> 上表的体积 / 冷启动是**早期基线**（dec.exe 入包之前测得，且随 PyMuPDF / Pillow
+> 版本变化），只用于两种形态之间的**相对比较**，不要当作当前版本的验收指标。
+> 需要准确数字时以当次构建脚本的实打输出为准。
 | 退出 | 自动清理临时解压目录 | 不留临时文件 |
 | SmartScreen | 相对更容易被拦 | 相对少见 |
 
@@ -360,6 +380,11 @@ python packaging/deploy_lddec.py --from D:\Tools\dec.exe  # 只给一个 exe 也
 python packaging/deploy_lddec.py --check                  # 检查是否已被识别
 ```
 
+换版本时 `deploy` 会一并重写 `tools/LDDec/SHA256.txt`（记录来源、生成时间与
+SHA256）；`--check` 会核对指纹。`tests/test_entrypoint.py` 把「二进制与清单一致」
+做成用例 —— 换了二进制却没更新清单，回归会直接失败。溯源记录另见
+`docs/integration-lddec.md` 的「随包分发的 `dec.exe`」一节。
+
 自动搜索顺序：`WM_LDDEC_EXE` → 程序目录下 `LDDec/`、`tools/LDDec/`、程序目录本身、
 `tools/lddec/`。打包时 `tools/LDDec/` 会**原样收进** exe（冻结后落在
 `sys._MEIPASS/tools/LDDec/`）。
@@ -388,10 +413,12 @@ LDDec 有**两套**实现，二进制都叫 `dec.exe`，命令行用法相同（
 | 环境变量 | 含义 |
 |---|---|
 | `WM_LDDEC_EXE` | 显式指定 dec.exe 路径（或其所在目录），优先级高于自动搜索 |
-| `WM_DLP_ENABLE` | `0` / `off` 一键关停整个解密通道 |
-| `WM_DLP_DECRYPT_CMD` | 想接**别的**解密器时用，命令模板如 `"…{src}" "{dst}"` |
-| `WM_DLP_TIMEOUT` | 单文件解密超时秒数（默认 30；LDDec 通道 60） |
-| `WM_DLP_MAGIC` | 加密魔数（十六进制，默认 `88 7d 1c`） |
+| `WM_DLP_ENABLE` | `0` / `off` / `false` / `no`（**不区分大小写**）一键关停整个解密通道；不设即启用 |
+| `WM_DLP_DECRYPT_CMD` | 想接**别的**解密器时用，命令模板如 `"…{src}" "{dst}"`（填了它就**只**用这条） |
+| `WM_DLP_TIMEOUT` | 单通道超时秒数（默认 30；LDDec 通道默认 60），**对内置链同样生效** |
+| `WM_DLP_BUDGET` | 单个文件的解密**总预算**秒数（默认 120，覆盖各通道重试；`0` / 负数 = 不限）。总闸，防「拖 20 个加密文件卡几十分钟且关不掉」 |
+| `WM_DLP_MAX_BYTES` | 明文**总量**上限字节（默认 4 GB）：一次性拖入几百个大文件时防撑爆磁盘 |
+| `WM_DLP_MAGIC` | 加密魔数（十六进制，默认 `88 7d 1c`）；配错会在日志里留一行 `[WARN]` |
 
 自动搜索顺序：`WM_LDDEC_EXE` → 程序目录下 `LDDec/`、`tools/LDDec/`、程序目录本身、
 `tools/lddec/`。
@@ -416,11 +443,19 @@ LDDec 有**两套**实现，二进制都叫 `dec.exe`，命令行用法相同（
 
 ### 相关测试
 
-`tests/test_dlp.py`（19 条）：魔数探测、未加密零开销、明文内容正确、原文件不被
+`tests/test_dlp.py`（29 条）：魔数探测、未加密零开销、明文内容正确、原文件不被
 改写、按钮与拖拽同一条链路、失败 / 损坏只跳过自己、明文清理、外部命令不碰原文件、
 批处理读明文但按原文件命名；LDDec 专属：自动发现与优先级、只交副本不交目录、
-cmd 版无 config.json 也要能跑、退出码 -1 的错误可行动；回退链专属：按序试到成功、
-全失败时汇总各通道原因、**系统读取通道跑真实子进程**验证字节保真且不改写原文件。
+cmd 版无 config.json 也要能跑、退出码 -1 的错误可行动、畸形命令模板只报错不中断
+批次；回退链专属：按序试到成功、全失败时汇总各通道原因、**系统读取通道跑真实子
+进程**验证字节保真且不改写原文件、总预算生效、取消即停、明文总量上限、解密器
+遗留的杂项文件被清理、明文失效 / 被替换能被识别并给出可行动提示。
+
+`tests/test_entrypoint.py` 另外钉住随包二进制：`dec.exe` 是合法 PE、能被
+`dlp.find_lddec()` 自动发现、与 `tools/LDDec/SHA256.txt` 指纹一致、无参数运行时
+**会自行退出**（挂住会拖死整条解密链路）。
 
 真实 `dec.exe` 的端到端冒烟已在本机跑过（无绿盾环境）：调用成功、接管就地覆盖产物、
 校验判为"仍是密文"并给出准确提示、**原文件字节不变**、明文目录无残留。
+**在真实加密环境上的端到端验证也已通过**（内网实机 v1.0.3：拖入即解密、能预览、
+能出成品），详见 `AUDIT-FINAL-2026-09-26.md` §四。

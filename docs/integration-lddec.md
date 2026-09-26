@@ -17,7 +17,7 @@
 | 5 `wm/ui/preview_job.py` | ➖ | 不必改：预览拿到的是 `Document.read_path`（明文） |
 | 6 `wm/ui/batch.py` | ✅ | 新增可选 `read_path` 回调；输出命名仍按原路径 |
 | 7 `wm/ui/output.py` | ➖ | 不必改：`plan_output` 用的就是原路径 |
-| 8 `tests/test_dlp.py` | ✅ | 11 条用例，见 `README.md` §十一 |
+| 8 `tests/test_dlp.py` | ✅ | 29 条用例（另有 `tests/test_entrypoint.py` 覆盖随包二进制），见 `README.md` §十一 |
 | 9 文档 | ✅ | `README.md` §十一 |
 
 ## LDDec 的两个版本（**重要修正**）
@@ -41,14 +41,40 @@
 适配层对两者**通用**的部分：自己判断头 3 字节；产物先落临时文件再就地覆盖；单文件
 模式不打输出。差异部分（config.json 是否必需）**不做前置检查**，否则会误伤 cmd 版。
 
+## 随包分发的 `dec.exe`（溯源记录）
+
+内置适配器用的是仓库里 **cmd 版**（`WinDec/`）二进制，不是 TCP 版。**这一版与
+§2.3 的合规红线不冲突**，因为它不含 `Faker` 组件：它不改名自身、不起本地 TCP
+服务、不冒充白名单进程，只是 `system('type "文件" > "文件_dec"')` —— 借
+**系统自带**的 `cmd.exe` 去读文件，是否返回明文完全取决于管理员已有的策略。
+这与本工具自带的 `CommandProvider`（`cmd /c type`）属于同一类手段。
+
+| 项 | 值 |
+|---|---|
+| 文件 | `tools/LDDec/dec.exe` |
+| 版本形态 | cmd 版（`WinDec/main.cpp`）：无 `config.json`、无 TCP、无 Faker |
+| SHA256 | `048601c7ae4a1479cdfcd21a8881d20b7956354def62c616f15197151876a419` |
+| 来源 | 贵司 `price-tool` 中已验证可用的同一份二进制（未重新编译） |
+| 校验 | `python packaging/deploy_lddec.py check` 会打印 SHA256 并与 `tools/LDDec/SHA256.txt` 比对 |
+
+> `tools/LDDec/SHA256.txt` 是**唯一可信清单**；换版本时用
+> `python packaging/deploy_lddec.py deploy <来源目录>` 重新部署，它会一并重写清单。
+> `.gitignore` 默认拦掉所有 `*.exe`，只有这一个文件被显式放行。
+
+**已知未验证项**：本机（开发环境）没有绿盾客户端，因此 `dec.exe` 只验证到
+"能启动、退出码 0、不改写原文件"，**尚未在真实加密文件上验证它能产出明文**。
+内网实机验证结果见 `AUDIT-FINAL-2026-09-26.md` §四。
+
 ## 仍未做的事（按 §2.3 红线）
 
-- 不实现进程伪装 / 冒充白名单进程（那是 LDDec 自带 Faker 的行为，由部署方决定，
-  本工具不复刻、也不改名自身可执行文件）。系统读取通道只是让**系统自带的**
-  `cmd.exe` / `powershell.exe` 去读文件，是否返回明文完全取决于管理员策略；
+- 不实现进程伪装 / 冒充白名单进程（那是 LDDec **TCP 版** Faker 的行为，随包分发的
+  cmd 版本身不含该组件；本工具不复刻、也不改名自身可执行文件）。系统读取通道只是
+  让**系统自带的** `cmd.exe` / `powershell.exe` 去读文件，是否返回明文完全取决于
+  管理员策略；
 - 不启用"就地覆盖原文件"的解密模式 —— 交给任何通道的永远是临时副本，明文只落
   受控临时目录（这是与 `price-tool` 的**唯一实质分歧**：它解密后就地替换原文件，
-  本工具经确认后保持"绝不改写原文件"）；
+  本工具经确认后保持"绝不改写原文件"）。即使 `dec.exe` 自身是覆盖式实现，调用方
+  也只把它作用在临时目录里的副本上；
 - `dec.exe` 随包分发（`tools/LDDec/`），来源为贵司 `price-tool` 中已验证可用的
   cmd 版；仍提供 `packaging/deploy_lddec.py` 以便换成别的版本。
 

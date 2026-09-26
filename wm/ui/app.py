@@ -20,6 +20,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -64,6 +65,10 @@ class App:
         self.page_index = 0
         self.out_dir: Optional[str] = None
         self._current_index = -1
+        # 拖拽去重（同一份数据在 1 秒内只处理一次）：拖拽目标注册了三处，
+        # 事件可能向祖先控件再派发一次，见 _on_drop
+        self._last_drop_data = ""
+        self._last_drop_at = 0.0
 
         self._queue: "queue.Queue[dict]" = queue.Queue()
         self._preview_job: Optional[str] = None
@@ -351,14 +356,49 @@ class App:
         """
         if self._list_locked():
             return "break"
-        try:
-            paths = list(self.root.tk.splitlist(event.data))
-        except Exception:
-            # splitlist 遇到非法 Tcl 列表串会抛（例如含未配对花括号的罕见路径）；
-            # 退化成「整串当一条路径」仍然比直接丢弃更接近用户意图。
-            paths = [event.data]
-        self._add_paths(paths)
+        data = str(getattr(event, "data", "") or "")
+        # 去重：拖拽目标注册了三处（文件列表 / 预览区 / 左侧面板），而**文件列表
+        # 是左侧面板的后代**。``return "break"`` 未必能终止向祖先派发，一次投放会
+        # 触发两次 —— 表现为重复解密一遍（慢一倍）并可能弹两个失败框。
+        # 同一份数据在一个很短的时间窗内只处理一次。
+        now = time.monotonic()
+        if data and data == self._last_drop_data and now - self._last_drop_at < 1.0:
+            return "break"
+        self._last_drop_data = data
+        self._last_drop_at = now
+        self._add_paths(self._split_dropped(data))
         return "break"
+
+    def _split_dropped(self, data: str) -> List[str]:
+        """把 tkdnd 给的 Tcl 列表串拆成路径列表。
+
+        ``tk.splitlist`` 遇到未配对花括号会抛异常；早先的兜底是「整串当一条路径」，
+        于是多文件投放里只要有一个含花括号就**整批失效**。这里改为手工解析：
+        花括号内整段算一个路径，其余按空白切 —— 至少能把大部分文件救回来。
+        """
+        try:
+            return [str(p) for p in self.root.tk.splitlist(data)]
+        except Exception:
+            pass
+        paths: List[str] = []
+        buffer: List[str] = []
+        depth = 0
+        for ch in data:
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth = max(0, depth - 1)
+                continue
+            if ch.isspace() and depth == 0:
+                if buffer:
+                    paths.append("".join(buffer))
+                    buffer = []
+                continue
+            buffer.append(ch)
+        if buffer:
+            paths.append("".join(buffer))
+        return paths or ([data] if data else [])
 
     def add_files(self, paths: List[str]) -> None:
         """公开入口：把一批路径加入列表（供 main.py / CLI / 测试使用）。
@@ -439,14 +479,36 @@ class App:
         * **加密且解不了** → 记进失败清单，**不进列表**，不影响同批其它文件。
 
         解密是同步的：非加密文件的探测开销可忽略（每文件一次 3 字节读），真正
-        会慢的只有"确实需要解密"的文件，且每处理一个就泵一次 Tk 事件，
-        避免大批量时被系统判成无响应。
+        会慢的只有"确实需要解密"的文件。因此这里做三件事防止"拖 20 个加密文件
+        就几十分钟无响应"：
+
+        * 每个文件单独 ``try`` —— 一个探测异常不能打断整批（否则已成功的也不入列表）；
+        * 每处理一个就 ``update()``（**不只是** ``update_idletasks``）并汇报进度 ——
+          ``update_idletasks`` 不处理输入事件，用户点关闭/取消都收不到；
+        * 关窗或取消一旦发生就**立即停止**后续文件，已解析的照常返回。
         """
         usable: List[str] = []
         failures: List[Tuple[str, str]] = []
         direct = 0
-        for path in paths:
-            result = dlp.resolve(path)
+        total = len(paths)
+        for index, path in enumerate(paths):
+            if self._closing:
+                break
+            if total > 1:
+                self._set_status(f"正在检查文件… {index + 1}/{total}", T.TEXT_DIM)
+                # update() 会处理真实输入事件（关闭按钮 / Esc），比 update_idletasks
+                # 慢一点，但拖大批量时这是唯一能让用户"叫停"的通道。
+                try:
+                    self.root.update()
+                except Exception:
+                    pass  # 窗口已被销毁：本轮结束后自然退出
+                if self._closing:
+                    break
+            try:
+                result = dlp.resolve(path)
+            except Exception as exc:  # resolve 自身不该抛；真抛了也不能连累整批
+                failures.append((path, f"检查失败：{type(exc).__name__}: {exc}"))
+                continue
             if result.path is None:
                 failures.append((path, result.message or "无法解密"))
                 continue
@@ -454,10 +516,8 @@ class App:
                 # 命中加密魔数但读得开：白名单已生效 / 魔数误判，按原样继续
                 direct += 1
             if result.read_path and result.read_path != result.path:
-                self._plain[result.path] = result.read_path
+                self._plain_map()[result.path] = result.read_path
             usable.append(result.path)
-            if len(paths) > 1:
-                self._pump()
         if direct:
             self._set_status(f"{direct} 个文件疑似受加密保护，已按原样读取", T.WARN)
         return usable, failures
@@ -499,9 +559,17 @@ class App:
             dlp.release(plain)
 
     def _release_all_plain(self) -> None:
-        """释放本实例持有的全部临时明文（关窗时）。"""
+        """释放本实例持有的全部临时明文（关窗时）。
+
+        逐个独立兜错：某个文件删不掉（句柄未释放 / 被安全软件占用）不能中断后面
+        的清理，否则第一个失败就会把其余明文全留在磁盘上。
+        """
         for path in list(self._plain_map()):
-            self._release_plain(path)
+            try:
+                self._release_plain(path)
+            except Exception as exc:
+                print(f"[WARN] 清理临时明文失败（{os.path.basename(path)}）：{exc!r}",
+                      file=sys.stderr)
 
     def _pump(self) -> None:
         """泵一次 Tk 事件（保持界面不僵死）；控件已销毁时静默。"""
@@ -711,9 +779,13 @@ class App:
     def _preview_worker(self, gen: int, path: str, page: int, spec: WatermarkSpec,
                         canvas_w: int, canvas_h: int) -> None:
         try:
+            # 明文被删 / 被换时 render_preview 会把**具体**原因交给 problems，
+            # 这里统一在「out 为 None」这一个出口上报 —— 否则同一帧会推两条消息。
+            problems: list = []
             out, page_w, page_h = preview_job.render_preview(
                 path, page, spec, canvas_w, canvas_h,
-                is_cancelled=lambda: self._preview_stale(gen))
+                is_cancelled=lambda: self._preview_stale(gen),
+                on_problem=problems.append)
             if out is preview_job.CANCELLED:
                 # 作废帧（含被取消的）：**不能**当错误处理 —— 否则拖滑杆时预览区会
                 # 反复闪「预览失败」。
@@ -723,7 +795,8 @@ class App:
                 # 打开 / 渲染失败：preview_job 已吞掉异常并返回 None，这里按原始
                 # _preview_worker 的 error 载荷上报（不含 page_w / page_h）。
                 self._queue.put({"kind": "preview", "gen": gen,
-                                 "error": "预览渲染失败：文件无法打开或页面不存在"})
+                                 "error": problems[0] if problems else
+                                 "预览渲染失败：文件无法打开或页面不存在"})
             else:
                 self._queue.put({"kind": "preview", "gen": gen, "image": out,
                                  "page_w": page_w, "page_h": page_h})
@@ -764,6 +837,12 @@ class App:
             return
         if self._batch_thread is not None and self._batch_thread.is_alive():
             return
+        # **先掐掉在飞的预览**：_set_busy 只挡「新请求」，已在途的那一帧仍会
+        # 分配一整份全分辨率位图（8000×8000 单帧实测 ~777MB）并与批处理争内存 ——
+        # 两者叠加可能直接被系统杀进程。bump 代号让在途帧作废、清掉 pending
+        # 让它不会被补跑；批处理结束后会按最新参数补一帧（见 done 分支）。
+        self._preview_gen += 1
+        self._preview_pending = False
         self._cancel = False
         spec = self.panel.spec()
         files = list(self.files)
@@ -795,6 +874,13 @@ class App:
         self.out_btn.set_enabled(not busy)
         self.out_reset_btn.set_enabled(not busy)
         self.cancel_btn.set_enabled(busy)
+        # 翻页也要禁用：批处理期翻页只改**导航显示**（第 5 页），而预览被
+        # ``_schedule_preview`` 的 busy 闸门挡住不会重画 —— 结果就是「写着第 5 页、
+        # 画面还是第 2 页」，且结束后不会自动纠正（除非用户再动一下）。
+        for name in ("prev_btn", "next_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.set_enabled(not busy)
 
     def _batch_worker(self, files: List[str], spec: WatermarkSpec,
                       out_dir: Optional[str]) -> None:
@@ -808,21 +894,35 @@ class App:
         def _on_log(text: str) -> None:
             self._queue.put({"kind": "log", "text": text})
 
+        sent = False
+
         def _on_done(succeeded: int, failed, cancelled: bool) -> None:
+            nonlocal sent
             self._queue.put({"kind": "done", "succeeded": succeeded,
                              "failed": failed, "cancelled": cancelled})
+            sent = True  # 放在 put **之后**：put 自身失败时下面的兜底才会接上
 
         # 循环体已抽到 batch.run_batch（纯逻辑，可无头单测）。这里只负责把 App 的
         # 取消标志 / 队列接到回调上，保持与原来完全一致的载荷形状。
-        batch.run_batch(
-            files, spec, out_dir,
-            is_cancelled=lambda: self._cancel,
-            on_progress=_on_progress,
-            on_log=_on_log,
-            on_done=_on_done,
-            # 解密在添加阶段已完成，这里只负责把原路径换成明文路径；
-            # 输出命名仍按原路径（见 batch.run_batch）
-            read_path=self._read_path)
+        try:
+            batch.run_batch(
+                files, spec, out_dir,
+                is_cancelled=lambda: self._cancel,
+                on_progress=_on_progress,
+                on_log=_on_log,
+                on_done=_on_done,
+                # 解密在添加阶段已完成，这里只负责把原路径换成明文路径；
+                # 输出命名仍按原路径（见 batch.run_batch）
+                read_path=self._read_path)
+        except Exception as exc:
+            # run_batch 内部已有 finally 保证 on_done；这里挡的是**回调本身**抛错
+            # 或队列写入失败 —— 那种情况下界面同样会永久停在「处理中」。
+            # sent 为真说明 done 已入队，不能再补一个（否则会弹两次完成框）。
+            if not sent:
+                self._queue.put({"kind": "log",
+                                 "text": f"[FAIL] 批处理异常终止：{type(exc).__name__}: {exc}"})
+                self._queue.put({"kind": "done", "succeeded": 0,
+                                 "failed": [], "cancelled": True})
 
     @staticmethod
     def _save_image(
@@ -857,20 +957,36 @@ class App:
         try:
             while True:
                 item = self._queue.get_nowait()
-                self._handle_result(item)
+                try:
+                    self._handle_result(item)
+                except Exception as exc:
+                    # **不能让单个结果带崩整条轮询链**：下面的 after() 在循环外，
+                    # 异常一旦穿出就再也排不上 —— 进度条冻结、_busy 永远为 True，
+                    # 用户只能杀进程。坏一帧的代价远小于断链，所以这里单独兜住。
+                    print(f"[WARN] 处理队列结果失败：{exc!r}", file=sys.stderr)
         except queue.Empty:
             # 队列空是**正常轮空**（每 50ms 都会发生），不是异常流程；
             # 正是这个 Empty 让 drain 循环结束，所以必须吞。
             pass
-        if self._closing:
-            return  # 关窗后不再续接（否则销毁后 Tcl 仍会执行 -> invalid command name）
-        # 预览闸门已放开、且期间又有人提了新请求 -> 用**最新参数**补跑一帧。
-        # 放在主线程里做，避免从工作线程调 Tk（Tk 不是线程安全的）。
-        if self._preview_pending and not self._preview_busy:
-            self._render_preview_async()
-        if self._closing:
-            return
-        self._poll_job = self.root.after(_POLL_MS, self._poll_results)
+        try:
+            if self._closing:
+                return  # 关窗后不再续接（否则销毁后 Tcl 仍会执行 -> invalid command name）
+            # 预览闸门已放开、且期间又有人提了新请求 -> 用**最新参数**补跑一帧。
+            # 放在主线程里做，避免从工作线程调 Tk（Tk 不是线程安全的）。
+            if self._preview_pending and not self._preview_busy:
+                self._render_preview_async()
+            if self._closing:
+                return
+        except Exception as exc:
+            print(f"[WARN] 轮询回调异常：{exc!r}", file=sys.stderr)
+        finally:
+            if not self._closing:
+                try:
+                    self._poll_job = self.root.after(_POLL_MS, self._poll_results)
+                except Exception as exc:
+                    # root 已销毁：没有可续接的对象了，这本身就是终态
+                    print(f"[WARN] 无法续接轮询（窗口可能已销毁）：{exc!r}",
+                          file=sys.stderr)
 
     def _handle_result(self, item: dict) -> None:
         kind = item.get("kind")
@@ -892,6 +1008,11 @@ class App:
             print(str(item.get("text", "")))  # Windows 中文控制台用 [OK]/[FAIL]，不用 ✓
         elif kind == "done":
             self._set_busy(False)
+            # 批处理启动时我们把在飞的预览作废并清了 pending（避免两份全分辨率
+            # 图像并存），期间用户若翻过页、改过参数，画面就还停在旧状态。
+            # 这里按**最新**状态补一帧，否则预览会一直错位到用户手动触发为止。
+            if not self._closing and self.files and self._current_index >= 0:
+                self._schedule_preview(0)
             succeeded = int(item.get("succeeded", 0))
             failed = item.get("failed") or []
             cancelled = bool(item.get("cancelled"))
@@ -939,8 +1060,11 @@ class App:
         self._preview_job = None
         self._preview_gen += 1  # 作废在途预览结果，避免关窗后往死画布贴图
         self._close_doc()
-        self._release_all_plain()  # 解密出的临时明文绝不留在磁盘上
+        # 顺序不能颠倒：**先**等批处理线程收尾，**再**删临时明文。
+        # 反过来的话，线程正在读的明文会在它脚下被删掉 —— 表现是输出半截、或误报
+        # 「文件不存在」，而且极难复现（取决于删除发生在第几页）。
         self._join_batch(_CLOSE_JOIN_SEC)
+        self._release_all_plain()  # 解密出的临时明文绝不留在磁盘上
 
     def _cancel_after(self, job: Optional[str]) -> None:
         """取消一个 ``after`` 回调。"""
@@ -1004,13 +1128,4 @@ class App:
         self._set_status(f"内部错误：{key[0]}: {val}", T.DANGER)
 
 
-def run() -> None:
-    """创建根窗口并进入主循环（供 main.py 与冒烟测试复用）。"""
-    from tkinterdnd2 import TkinterDnD
-    T.enable_dpi_awareness()
-    root = TkinterDnD.Tk()
-    App(root)
-    root.mainloop()
-
-
-__all__ = ["App", "run", "TITLE"]
+__all__ = ["App", "TITLE"]

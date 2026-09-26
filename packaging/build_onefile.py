@@ -60,6 +60,25 @@ def main() -> int:
         raise SystemExit("[FAIL] dist/_internal 存在，说明打成了目录版")
     print("[OK] 单文件产物: %s (%.1f MB)" % (EXE, os.path.getsize(EXE) / 1e6))
 
+    # 4b) 关键依赖**必须真的进了包**：目录版脚本有 mupdf DLL 与 tkdnd 的断言，
+    # 单文件版原本一个都没有 —— 而单文件是实际交付形态，缺了它照样能构建成功、
+    # 运行时才炸。这里做字节级抽查（与 _smoke/verify_exe_bytes.py 同源思路）。
+    blob = open(EXE, "rb").read()
+    required = {
+        "mupdf DLL": b"mupdf",
+        "tkdnd 库": b"tkdnd",
+        "解密适配层": b"WM_DLP_DECRYPT_CMD",
+    }
+    dec_dir = os.path.join(ROOT, "tools", "LDDec")
+    dec_exe = os.path.join(dec_dir, "dec.exe")
+    if os.path.isfile(dec_exe):
+        required["LDDec（dec.exe）"] = b"dec.exe"
+    for label, token in required.items():
+        if token not in blob:
+            raise SystemExit("[FAIL] 包内缺少 %s（搜不到 %r），拒绝交付"
+                             % (label, token))
+        print("  [OK] 已包含 %s" % label)
+
     # 5) 自检验收（同目录版：退出码 + 报告无 [FAIL] 双重判定）
     accept_dir = os.path.join(BUILD, "_accept_one")
     proc = subprocess.run([EXE, "--selftest", accept_dir], timeout=900)

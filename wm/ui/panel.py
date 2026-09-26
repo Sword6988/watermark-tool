@@ -109,6 +109,14 @@ class ScrolledFrame(tk.Frame):
         窗口的处理器会跟着一起跑 —— 表现为滚轮越用越卡、偶发指向已销毁控件的
         TclError。所以这里按实例计数，最后一个走人的实例负责解绑。
         """
+        # 先撤掉自己挂的合并定时器：它回调里要碰 ``self.canvas``，而 super().destroy()
+        # 之后控件已经没了 —— Tcl 会在下一个 16ms 回调里报 invalid command name。
+        try:
+            if self._wheel_job is not None:
+                self.after_cancel(self._wheel_job)
+        except Exception:
+            pass
+        self._wheel_job = None
         try:
             if self._wheel_bound:
                 ScrolledFrame._LIVE_COUNT -= 1

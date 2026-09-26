@@ -1,0 +1,6 @@
+# LDDec 运行文件指纹（由 packaging/deploy_lddec.py 生成）
+# 用途：换机器 / 换版本后能核对文件是否被替换，满足供应链可追溯要求
+# 来源：D:\UserData\Administrator\Desktop\price-tool
+# 生成时间：2026-09-26 21:15:45
+
+048601c7ae4a1479cdfcd21a8881d20b7956354def62c616f15197151876a419  dec.exe

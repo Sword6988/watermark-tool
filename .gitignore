@@ -9,6 +9,13 @@ __pycache__/
 *.pyc
 *.pyo
 
+# ---- Binaries ----
+# 默认不放行任何 exe（构建产物、随手丢进来的第三方程序）。
+*.exe
+# 唯一例外：随包分发的 LDDec 解密器，它是运行期依赖，必须进版本库。
+# 校验和见 tools/LDDec/SHA256.txt，来源记录见 docs/integration-lddec.md。
+!tools/LDDec/dec.exe
+
 # ---- Virtual environments ----
 .venv/
 venv/

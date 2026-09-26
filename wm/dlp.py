@@ -32,9 +32,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 #: 天锐绿盾加密文件头（与文件格式无关：PDF / 图片一视同仁，见集成方案文档）。
 #: 可用环境变量 ``WM_DLP_MAGIC``（十六进制串，如 ``"88 7d 1c"``）覆盖。
@@ -47,6 +48,17 @@ _VERIFY_READ_LEN = 1024
 
 #: 单个文件的解密超时（秒）。驱动无响应时不能把整个添加过程挂死。
 DEFAULT_TIMEOUT = 30.0
+
+#: **单个文件的解密总预算**（秒）。它是「每通道超时」之上的一道总闸：
+#: 三条通道各自 60/60/90 秒时，最坏会卡 330 秒且中途无法取消。有了总预算，
+#: 每条通道只拿到「剩余预算」，超时即放弃该文件转下一个。可用
+#: ``WM_DLP_BUDGET`` 覆盖（0 或负数表示不设总闸）。
+DEFAULT_BUDGET = 120.0
+
+#: 临时明文的总量上限（字节）。明文必须常驻到文件从列表移除为止，所以**不能**
+#: LRU 淘汰（淘汰了就没得读了）；改用「到达上限后停止继续解密并提示分批」，
+#: 避免一次拖入几百个大文件把磁盘撑爆。可用 ``WM_DLP_MAX_BYTES`` 覆盖。
+DEFAULT_MAX_PLAIN_BYTES = 4 * 1024 * 1024 * 1024
 
 #: ``cmd /c type`` 通道的超时。大 PDF 走 type 是逐字节复制，比普通命令慢。
 CMDTYPE_TIMEOUT = 60.0
@@ -89,6 +101,18 @@ class DecryptError(Exception):
 # 加密探测
 # ---------------------------------------------------------------------------
 
+def _warn(message: str) -> None:
+    """记一条诊断信息（不打扰用户：解密链路的旁支不该弹框）。
+
+    写 stderr 而不是日志框架：本模块可能被无头脚本直接调用，且在冻结版里
+    stderr 已被 ``main._FileWriter`` 接到 runtime.log，排查时找得到。
+    """
+    try:
+        print("[WARN][dlp] " + message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 def magic() -> bytes:
     """当前生效的加密魔数（默认 ``88 7D 1C``，可用环境变量覆盖）。"""
     raw = (os.environ.get("WM_DLP_MAGIC") or "").strip().replace(" ", "").replace("0x", "")
@@ -97,7 +121,10 @@ def magic() -> bytes:
     try:
         return bytes.fromhex(raw)
     except ValueError:
-        # 配错了也不能让工具起不来：退回默认值（最多是探测不到，不会误伤）
+        # 配错了也不能让工具起不来：退回默认值 —— 但**必须留痕**，否则「魔数
+        # 配错导致一律探测不到」和「本机根本没有加密文件」在用户看来一模一样。
+        _warn("WM_DLP_MAGIC 不是合法十六进制串（%r），已回退默认魔数 %s"
+              % (raw, DEFAULT_MAGIC.hex(" ")))
         return DEFAULT_MAGIC
 
 
@@ -176,16 +203,112 @@ def _ascii_temp_root() -> Optional[str]:
     for path in candidates:
         if path and path.isascii() and os.path.isdir(path):
             return path
+    # 回落到 None 意味着「明知有坑还要踩」：cmd 版 type 走 ANSI，非 ASCII 路径
+    # 会读不到文件。此时报错文案会让人「确认临时目录为纯 ASCII」，而代码自己
+    # 刚放弃了这个保证 —— 所以必须留痕，否则排查时会原地打转。
+    _warn("找不到纯 ASCII 的临时目录（候选：%s），"
+          "cmd 版解密器可能因非 ASCII 路径读不到文件" % "、".join(map(str, candidates)))
     return None
+
+
+#: 明文目录的名字前缀（启动期 GC 靠它识别「本工具留下的目录」）
+PLAIN_DIR_PREFIX = "wm-dlp-"
+
+#: 目录里记录的持有者 pid 文件名：GC 靠它区分「别的实例在用」与「孤儿目录」
+_PID_FILE = "owner.pid"
+
+_gc_done = False
 
 
 def plaintext_dir() -> str:
     """明文临时目录（懒创建）。用 ``mkdtemp``：权限仅当前用户，且可被系统清理。"""
-    global _plain_dir
+    global _plain_dir, _gc_done
     with _state_lock:
         if _plain_dir is None or not os.path.isdir(_plain_dir):
-            _plain_dir = tempfile.mkdtemp(prefix="wm-dlp-", dir=_ascii_temp_root())
+            _plain_dir = tempfile.mkdtemp(prefix=PLAIN_DIR_PREFIX, dir=_ascii_temp_root())
+            _write_owner_pid(_plain_dir)
+            if not _gc_done:
+                _gc_done = True
+                _gc_orphan_dirs(_plain_dir)
         return _plain_dir
+
+
+def _write_owner_pid(directory: str) -> None:
+    """在明文目录里写下持有者 pid（供其它实例判断「还活着吗」）。"""
+    try:
+        with open(os.path.join(directory, _PID_FILE), "w", encoding="ascii") as handle:
+            handle.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """``pid`` 是否还在运行；无法判断时**保守返回 True**（宁可漏删也不误删）。"""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return True  # 查不了就当活着
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _gc_orphan_dirs(keep: str) -> None:
+    """清理**上一轮崩溃 / 被强杀**残留的明文目录（启动期跑一次）。
+
+    ``atexit`` 只管正常退出；任务管理器结束进程、``os._exit``、断电都不会触发它，
+    那些目录里的明文会一直躺在 ``%TEMP%`` —— 明文是本项目最不该留下的东西，
+    所以下次启动时补一次清扫。
+
+    判定标准（**宁可漏删也不误删**）：名字匹配 ``wm-dlp-*``、不是当前目录、
+    且 ``owner.pid`` 缺失或对应进程已不存在。
+    """
+    roots = [tempfile.gettempdir()]
+    if os.name == "nt":
+        win_dir = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+        roots.append(os.path.join(win_dir, "Temp"))
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith(PLAIN_DIR_PREFIX):
+                continue
+            path = os.path.join(root, name)
+            if os.path.abspath(path) == os.path.abspath(keep):
+                continue
+            if not os.path.isdir(path):
+                continue
+            pid = -1
+            try:
+                with open(os.path.join(path, _PID_FILE), encoding="ascii") as handle:
+                    pid = int(handle.read().strip() or -1)
+            except (OSError, ValueError):
+                pid = -1
+            if pid > 0 and _pid_alive(pid):
+                continue  # 别的实例正在用，绝不碰
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                _warn("已清理上次异常退出残留的明文目录：%s" % path)
+            except OSError as exc:
+                _warn("残留明文目录清理失败（%s）：%s" % (path, exc))
 
 
 def new_plaintext_path(src: str) -> str:
@@ -199,24 +322,48 @@ def new_plaintext_path(src: str) -> str:
 
 
 def release(path: Optional[str]) -> None:
-    """删除一条明文；路径为空 / 已在别处清理过都安全。"""
+    """删除一条明文；路径为空 / 已在别处清理过都安全。
+
+    删不掉**必须留痕**：明文是本项目最敏感的中间产物，静默失败会让它在磁盘上
+    躺到系统清理为止，而排查时连线索都没有（Windows 上最常见的原因是文件仍被
+    占用 —— 往往是某个 PIL/fitz 句柄没关，见 ``wm.media`` 的 close 路径）。
+    """
+    global _plain_bytes
     if not path:
         return
+    # 先把账目扣回去：总量上限（M7）若只增不减，用户删掉一批文件后额度也不会
+    # 恢复，表现是「明明删光了却还是提示超过上限」。
+    with _state_lock:
+        spent = _plain_sizes.pop(os.path.abspath(path), 0)
+        _plain_bytes = max(0, _plain_bytes - spent)
     try:
         if os.path.isfile(path):
             os.remove(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        return
+    except OSError as exc:
+        _warn("删除临时明文失败（%s）：%s" % (path, exc))
+    # 兜底：确实删不掉时至少确认一下它到底还在不在，把结果写进日志
+    try:
+        if os.path.exists(path):
+            _warn("临时明文仍然存在，需人工/系统清理：%s" % path)
     except OSError:
-        # 删不掉（被占用 / 已删）没有补偿动作：atexit 与系统临时目录清理会兜底
         pass
 
 
 def release_all() -> None:
     """清空整个明文目录（进程退出 / 关闭时调用）。"""
-    global _plain_dir
+    global _plain_dir, _plain_bytes
     with _state_lock:
         directory, _plain_dir = _plain_dir, None
-    if directory:
-        shutil.rmtree(directory, ignore_errors=True)
+        _plain_sizes.clear()
+        _plain_bytes = 0
+    if not directory:
+        return
+    shutil.rmtree(directory, ignore_errors=True)
+    if os.path.exists(directory):  # 删完校验：静默失败在这里必须变成一条日志
+        _warn("明文目录未能清空（可能仍有文件被占用）：%s" % directory)
 
 
 atexit.register(release_all)
@@ -242,8 +389,56 @@ class DecryptProvider:
         """当前环境是否真的可用（缺依赖 / 缺配置时返回 ``False``）。"""
         return False
 
-    def decrypt(self, src: str, dst: str) -> None:
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        """解密 ``src`` 到 ``dst``。
+
+        ``deadline`` 是 :func:`time.monotonic` 刻度上的**绝对时限**：由调用方按
+        「单文件总预算」算出，各通道据此裁自己的超时，避免三条通道各等满一次
+        把添加过程拖到几分钟且无法取消。``None`` 表示不限。
+        """
         raise DecryptError("该解密提供者未实现")
+
+    def problem(self) -> str:
+        """不可用时**给用户看的原因**（可用则返回空串）。
+
+        「没有解密器」和「解密器配错了」在用户看来都是「加不进去」，但前者要找
+        管理员、后者改一行配置就行 —— 必须区分。
+        """
+        return ""
+
+
+def _supports_deadline(provider: "DecryptProvider") -> bool:
+    """``provider.decrypt`` 是否接受 ``deadline`` 参数。
+
+    内置的都接受；**第三方 / 测试替身**可能仍是老的两参数签名。按签名探测比
+    "先试着传、捕获 TypeError" 稳妥 —— 后者会把 decrypt 内部抛的 TypeError
+    误判成"不支持"再跑一次，副作用不可控。
+    """
+    try:
+        import inspect
+        return "deadline" in inspect.signature(provider.decrypt).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_decrypt(provider: "DecryptProvider", src: str, dst: str,
+                  deadline: Optional[float]) -> None:
+    """按提供者能力调用 decrypt（老签名自动降级为不带 deadline）。"""
+    if _supports_deadline(provider):
+        provider.decrypt(src, dst, deadline=deadline)
+    else:
+        # 老签名（第三方 / 测试替身）：只给两个位置参数，代价是它拿不到总预算
+        provider.decrypt(src, dst)
+
+
+def _budget_timeout(timeout: float, deadline: Optional[float], floor: float = 1.0) -> float:
+    """把「本通道期望超时」与「剩余总预算」取小；预算耗尽则返回 ``floor``。"""
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= floor:
+        return floor
+    return min(timeout, remaining)
 
 
 class CommandProvider(DecryptProvider):
@@ -269,27 +464,37 @@ class CommandProvider(DecryptProvider):
     def available(self) -> bool:
         return bool(self._argv)
 
-    def decrypt(self, src: str, dst: str) -> None:
+    def problem(self) -> str:
+        if self._argv:
+            return ""
+        return ("WM_DLP_DECRYPT_CMD 无法解析成命令行（%s）—— 多半是引号未闭合"
+                % (self.template or "空"))
+
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
         if not self._argv:
-            raise DecryptError("解密命令为空")
+            raise DecryptError(self.problem())
         ext = os.path.splitext(src)[1]
         work = os.path.join(plaintext_dir(), "s%s%s" % (uuid.uuid4().hex, ext))
         try:
             shutil.copy2(src, work)
         except OSError as exc:
             raise DecryptError(f"无法读取源文件（{exc}）") from exc
+        before = _snapshot_dir()
         try:
             argv = [part.format(src=work, dst=dst, ext=ext.lstrip("."))
                     for part in self._argv]
+            timeout = _budget_timeout(self.timeout, deadline)
             try:
-                completed = subprocess.run(
-                    argv, cwd=plaintext_dir(), timeout=self.timeout,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=_NO_WINDOW)
+                # 串行：外部解密器常常独占端口/临时文件名，并发必然互相踩
+                with _call_lock:
+                    completed = subprocess.run(
+                        argv, cwd=plaintext_dir(), timeout=timeout,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        creationflags=_NO_WINDOW)
             except FileNotFoundError as exc:
                 raise DecryptError(f"解密器不存在：{self._argv[0]}") from exc
             except subprocess.TimeoutExpired:
-                raise DecryptError(f"解密超时（超过 {self.timeout:.0f} 秒）")
+                raise DecryptError(f"解密超时（超过 {timeout:.0f} 秒）")
             except OSError as exc:
                 raise DecryptError(f"调用解密器失败：{exc}") from exc
             if completed.returncode != 0:
@@ -307,10 +512,16 @@ class CommandProvider(DecryptProvider):
             if os.path.getsize(dst) <= 0:
                 raise DecryptError("解密产物为空（0 字节）")
         finally:
-            # 密文副本与其衍生文件一律清掉，只留 dst
-            for leftover in (work, work + ".dec_", work + "_dec"):
-                if os.path.abspath(leftover) != os.path.abspath(dst):
-                    release(leftover)
+            # 解密器产生的**一切**中间产物都清掉，只留 dst（目录快照差集）
+            _cleanup_new_files(before, dst)
+
+
+#: **所有**外部解密调用的串行锁。
+#:
+#: 不只是 LDDec：任何「固定端口 / 固定临时文件名」的解密器并发都会互相踩
+#: （表现为「返回 0 但没有产物」这类极难排查的失败）。解密本身是秒级的，
+#: 串行的代价远小于并发带来的不确定性。
+_call_lock = threading.RLock()
 
 
 class TransparentReadProvider(DecryptProvider):
@@ -348,7 +559,7 @@ class TransparentReadProvider(DecryptProvider):
         """把 ``work`` 的明文读到 ``dst``；失败抛 :class:`DecryptError`。"""
         raise NotImplementedError
 
-    def decrypt(self, src: str, dst: str) -> None:
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
         if not self.available():
             raise DecryptError(f"{self.label}通道在当前系统不可用")
         if not os.path.isfile(src):
@@ -359,14 +570,15 @@ class TransparentReadProvider(DecryptProvider):
             shutil.copy2(src, work)
         except OSError as exc:
             raise DecryptError(f"无法读取源文件（{exc}）") from exc
+        before = _snapshot_dir()
         try:
-            self._read_plaintext(work, dst)
+            self._read_plaintext(work, dst, _budget_timeout(self.timeout, deadline))
             if not os.path.isfile(dst):
                 raise DecryptError(f"{self.label}没有产生任何输出")
             if os.path.getsize(dst) <= 0:
                 raise DecryptError(f"{self.label}读到 0 字节（路径可能含非 ASCII 字符）")
         finally:
-            release(work)
+            _cleanup_new_files(before, dst)
 
 
 class CmdTypeProvider(TransparentReadProvider):
@@ -388,8 +600,9 @@ class CmdTypeProvider(TransparentReadProvider):
     def available(self) -> bool:
         return os.name == "nt" and bool(_cmd_executable())
 
-    def _read_plaintext(self, work: str, dst: str) -> None:
+    def _read_plaintext(self, work: str, dst: str, timeout: Optional[float] = None) -> None:
         cmd = _cmd_executable()
+        timeout = timeout if timeout and timeout > 0 else self.timeout
         attempts = (
             [cmd, "/c", "type", work],                 # 独立参数（标准）
             [cmd, "/c", "type", '"' + work + '"'],     # 手动加引号
@@ -402,7 +615,7 @@ class CmdTypeProvider(TransparentReadProvider):
                 with open(dst, "wb") as sink:
                     completed = subprocess.run(
                         args, stdout=sink, stderr=subprocess.PIPE,
-                        timeout=self.timeout, creationflags=_NO_WINDOW)
+                        timeout=timeout, creationflags=_NO_WINDOW)
             except subprocess.TimeoutExpired:
                 problems.append("超时")
                 continue
@@ -432,13 +645,18 @@ class PowershellProvider(TransparentReadProvider):
     def available(self) -> bool:
         return os.name == "nt" and bool(_powershell_executable())
 
-    def _read_plaintext(self, work: str, dst: str) -> None:
+    def _read_plaintext(self, work: str, dst: str, timeout: Optional[float] = None) -> None:
+        timeout = timeout if timeout and timeout > 0 else self.timeout
         # 路径进单引号字符串：只需把单引号本身翻倍；其余字符（含中文、空格、
         # 方括号、$）在单引号里都是字面量，无需再转义。
+        #
+        # 落盘必须用 **WriteAllBytes**（内部 FileMode.Create，会截断）。早先用的
+        # ``OpenWrite`` 不截断：一旦目标文件已存在且比本次产物长（例如上一次的
+        # 明文因占用没删掉），尾部就会残留上一个文件的内容，而
+        # ``verify_plaintext`` 只校验头部 —— 污染明文会被当成成功交付。
         script = (
-            "$b=[IO.File]::ReadAllBytes('" + work.replace("'", "''") + "');"
-            "$s=[IO.File]::OpenWrite('" + dst.replace("'", "''") + "');"
-            "$s.Write($b,0,$b.Length);$s.Close()"
+            "[IO.File]::WriteAllBytes('" + dst.replace("'", "''") + "',"
+            "[IO.File]::ReadAllBytes('" + work.replace("'", "''") + "'))"
         )
         release(dst)
         try:
@@ -446,9 +664,9 @@ class PowershellProvider(TransparentReadProvider):
                 [_powershell_executable(), "-NoProfile", "-NonInteractive",
                  "-Command", script],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                timeout=self.timeout, creationflags=_NO_WINDOW)
+                timeout=timeout, creationflags=_NO_WINDOW)
         except subprocess.TimeoutExpired:
-            raise DecryptError(f"{self.label}超时（超过 {self.timeout:.0f} 秒）")
+            raise DecryptError(f"{self.label}超时（超过 {timeout:.0f} 秒）")
         except OSError as exc:
             raise DecryptError(f"{self.label}调用失败：{exc}")
         if completed.returncode != 0:
@@ -477,20 +695,30 @@ class ChainProvider(DecryptProvider):
     def available(self) -> bool:
         return any(p.available() for p in self.providers)
 
+    def problem(self) -> str:
+        if self.available():
+            return ""
+        reasons = [p.problem() for p in self.providers if not p.available()]
+        return "；".join(r for r in reasons if r) or "所有解密通道在当前系统均不可用"
+
     def describe(self) -> str:
         ready = [p for p in self.providers if p.available()]
         return "、".join(_channel_label(p) for p in ready) or "无可用通道"
 
-    def decrypt(self, src: str, dst: str) -> None:
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
         if not self.providers:
             raise DecryptError("没有配置任何解密通道")
         notes: List[str] = []
         for provider in self.providers:
             if not provider.available():
                 continue
+            # 总预算已耗尽：后面的通道不用再试了，直接给出结论
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                notes.append("已用完全部解密时间预算")
+                break
             label = _channel_label(provider)
             try:
-                provider.decrypt(src, dst)
+                _call_decrypt(provider, src, dst, deadline)
             except DecryptError as exc:
                 notes.append(f"{label}：{exc}")
                 release(dst)
@@ -502,7 +730,7 @@ class ChainProvider(DecryptProvider):
             notes.append(f"{label}：{error}")
             release(dst)
         if not notes:
-            raise DecryptError("没有可用的解密通道")
+            raise DecryptError(self.problem() or "没有可用的解密通道")
         if len(notes) == 1:
             raise DecryptError(notes[0])
         # 全列会淹没界面：给总数 + 前两条，足够定位
@@ -655,7 +883,7 @@ class LddecProvider(DecryptProvider):
     def describe(self) -> str:
         return "LDDec（%s）" % os.path.basename(self.exe)
 
-    def decrypt(self, src: str, dst: str) -> None:
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
         if not self.available():
             raise DecryptError(f"未找到 LDDec 可执行文件：{self.exe}")
         exe_dir = os.path.dirname(self.exe)
@@ -672,16 +900,18 @@ class LddecProvider(DecryptProvider):
             shutil.copy2(src, work)
         except OSError as exc:
             raise DecryptError(f"无法读取源文件（{exc}）") from exc
+        before = _snapshot_dir()
+        timeout = _budget_timeout(self.timeout, deadline)
         try:
-            with _lddec_lock:  # 端口 34500 固定，绝不能并发
+            with _call_lock:  # 端口 34500 固定 / 临时产物同名，绝不能并发
                 try:
                     completed = subprocess.run(
-                        [self.exe, work], cwd=exe_dir, timeout=self.timeout,
+                        [self.exe, work], cwd=exe_dir, timeout=timeout,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         creationflags=_NO_WINDOW)
                 except subprocess.TimeoutExpired:
                     raise DecryptError(
-                        f"LDDec 解密超时（超过 {self.timeout:.0f} 秒）")
+                        f"LDDec 解密超时（超过 {timeout:.0f} 秒）")
                 except OSError as exc:
                     raise DecryptError(f"调用 dec.exe 失败：{exc}") from exc
             if completed.returncode != 0:
@@ -705,9 +935,7 @@ class LddecProvider(DecryptProvider):
             if os.path.getsize(dst) <= 0:
                 raise DecryptError("解密产物为空（0 字节）")
         finally:
-            for leftover in (work, work + ".dec_", work + "_dec"):
-                if os.path.abspath(leftover) != os.path.abspath(dst):
-                    release(leftover)
+            _cleanup_new_files(before, dst)
 
 
 def _split_command(template: str) -> List[str]:
@@ -718,9 +946,43 @@ def _split_command(template: str) -> List[str]:
     所以这里再手工剥掉成对的外层双引号 —— 否则带空格的程序路径会连引号一起被
     当成文件名。
     """
-    tokens = shlex.split(template, posix=False)
+    try:
+        tokens = shlex.split(template, posix=False)
+    except ValueError as exc:
+        # 引号未闭合时 shlex 抛 "No closing quotation"。这个异常过去会一路逃到
+        # Tk 回调里，把**整个添加批次**打断（已成功解析的文件也不进列表）。
+        # 切不出来就返回空表：available() 变 False、problem() 给出可行动的原因。
+        _warn("解密命令模板无法解析（%s）：%s" % (exc, template))
+        return []
     return [t[1:-1] if len(t) > 1 and t.startswith('"') and t.endswith('"') else t
             for t in tokens]
+
+
+def _snapshot_dir() -> Set[str]:
+    """明文目录的当前文件清单（解密器产出前后各拍一张，用于兜底清理）。"""
+    try:
+        return set(os.listdir(plaintext_dir()))
+    except OSError:
+        return set()
+
+
+def _cleanup_new_files(before: Set[str], keep: str) -> None:
+    """删掉解密器顺手留下的**一切**中间产物，只留 ``keep``。
+
+    早先只清理 ``work`` / ``work.dec_`` / ``work_dec`` 三个硬编码名字 —— 换个
+    解密器（或它改个后缀）就会把 ``.dec``、``.tmp`` 之类的残骸永久留在明文
+    目录里。改成「目录快照差集」后与解密器实现无关，任何产物都跑不掉。
+    """
+    directory = plaintext_dir()
+    keep_name = os.path.basename(keep)
+    try:
+        after = set(os.listdir(directory))
+    except OSError:
+        return
+    for name in (after - before):
+        if name == keep_name or name == _PID_FILE:
+            continue
+        release(os.path.join(directory, name))
 
 
 def _locate_plaintext(work: str, dst: str) -> Optional[str]:
@@ -804,21 +1066,39 @@ def _build_provider() -> Optional[DecryptProvider]:
     flag = (os.environ.get("WM_DLP_ENABLE") or "1").strip().lower()
     if flag in ("0", "false", "no", "off"):
         return None
+    timeout = _env_float("WM_DLP_TIMEOUT")
     template = (os.environ.get("WM_DLP_DECRYPT_CMD") or "").strip()
     if template:
-        try:
-            timeout = float((os.environ.get("WM_DLP_TIMEOUT") or "").strip()
-                            or DEFAULT_TIMEOUT)
-        except ValueError:
-            timeout = DEFAULT_TIMEOUT
-        return CommandProvider(template, timeout)
-    chain: List[DecryptProvider] = []
+        return CommandProvider(template, timeout or DEFAULT_TIMEOUT)
+    # ``WM_DLP_TIMEOUT`` 对内置链同样生效：文档写的是「单文件解密超时」，管理员
+    # 设成 10 秒就是希望快速失败，不该因为没配命令模板而失效。
+    if timeout and timeout > 0:
+        chain: List[DecryptProvider] = []
+        exe = find_lddec()
+        if exe:
+            chain.append(LddecProvider(exe, timeout))
+        chain.append(CmdTypeProvider(timeout))
+        chain.append(PowershellProvider(timeout))
+        return ChainProvider(chain)
+    chain = []
     exe = find_lddec()
     if exe:
         chain.append(LddecProvider(exe))
     chain.append(CmdTypeProvider())
     chain.append(PowershellProvider())
     return ChainProvider(chain)
+
+
+def _env_float(name: str) -> Optional[float]:
+    """读一个浮点环境变量；缺失或非法返回 ``None``（**并留痕**）。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        _warn("%s 不是数字（%r），已忽略该设置" % (name, raw))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -840,7 +1120,62 @@ class Resolution:
     message: str = ""
 
 
-def resolve(path: str) -> Resolution:
+#: 已落盘的临时明文累计字节数（用于 M7 的总量上限；受 _state_lock 保护）
+_plain_bytes = 0
+
+#: 明文落盘时的字节数（``abspath -> size``），读取前拿来比对。
+#:
+#: 为什么需要：明文躺在临时目录里，可能被磁盘清理工具、杀软或用户自己删掉；
+#: 若被**换成别的文件**，消费方照读不误，会静默产出错误内容。大小对不上拦不住
+#: 所有替换，但能挡住最常见的一类，且成本只有一次 ``getsize``。
+_plain_sizes: "Dict[str, int]" = {}
+
+
+def plain_bytes() -> int:
+    """当前临时明文占用的总字节数。"""
+    with _state_lock:
+        return _plain_bytes
+
+
+def plaintext_problem(path: Optional[str]) -> Optional[str]:
+    """读取**之前**校验一条明文路径是否还可用；``None`` 表示可用，否则是可直接
+    展示给用户的原因。
+
+    为什么必须由消费方（批处理 / 预览）来做（审计 M8）：这两处都是「取到路径就
+    直接读」，失败时一个走裸 ``except Exception``、一个干脆返回 ``None``，于是
+    「明文被删了」和「文件本身打不开」混成同一句没信息量的提示，日志里也没有
+    任何线索。这里把两者分开，原因直接可行动（重新添加该文件）。
+    """
+    if not path:
+        return "没有可读的文件内容"
+    with _state_lock:
+        expected = _plain_sizes.get(os.path.abspath(path))
+    known = expected is not None          # 是否本模块产出的明文
+    if not os.path.isfile(path):
+        return ("临时明文已失效（文件被删除或清理），请重新添加该文件" if known
+                else "文件不存在或已被移走，请重新添加")
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return "文件无法访问：%s" % exc
+    if size <= 0:
+        return ("临时明文为空（0 字节），解密可能未完成，请重新添加该文件" if known
+                else "文件为空（0 字节），无法读取")
+    if known and size != expected:
+        return ("临时明文大小已变化（%d → %d 字节），可能被其它程序改写，"
+                "请重新添加该文件" % (expected, size))
+    return None
+
+
+def max_plain_bytes() -> float:
+    """明文总量上限（``WM_DLP_MAX_BYTES``，单位字节；默认 4GB）。"""
+    configured = _env_float("WM_DLP_MAX_BYTES")
+    if configured is None or configured <= 0:
+        return float(DEFAULT_MAX_PLAIN_BYTES)
+    return configured
+
+
+def resolve(path: str, budget: Optional[float] = None) -> Resolution:
     """把一条路径解析成"可读路径"，必要时先解密。
 
     判定顺序（刻意保守，宁可多读一次也不误杀）：
@@ -851,21 +1186,47 @@ def resolve(path: str) -> Resolution:
     3. 打不开且**没有解密器** → 失败，原因写明"未配置解密器"；
     4. 打不开且有解密器 → 解密到临时目录 → 校验产物 → 成功返回临时明文路径，
        失败则清理产物并返回原因。
+
+    ``budget`` 是**本文件的解密总时限**（秒）。三条通道各自 60/60/90 秒时最坏会
+    卡 330 秒，用户既看不到进度也关不掉；总预算把时间切成「剩余可用量」分给
+    每条通道，超了就放弃该文件转下一个。    ``None`` 用 :data:`DEFAULT_BUDGET`
+    （可用 ``WM_DLP_BUDGET`` 覆盖，设为 0 表示不限）。
     """
+    global _plain_bytes
     if not is_encrypted(path):
         return Resolution(path, path, STATE_PLAIN)
     if probe_readable(path) is None:
         # 疑似加密但读得开：可能是透明解密已生效，也可能只是魔数撞上了
         return Resolution(path, path, STATE_DIRECT)
     provider = get_provider()
-    if provider is None or not provider.available():
+    if provider is None:
         return Resolution(
             None, None, STATE_FAILED,
             "文件受加密软件保护，当前环境无法解密（本机没有可用的解密组件）；"
             "请联系信息安全部门为水印工具授权")
+    if not provider.available():
+        return Resolution(
+            None, None, STATE_FAILED,
+            "文件受加密软件保护，且解密组件当前不可用 —— %s"
+            % (provider.problem() or "请联系信息安全部门为水印工具授权"))
+    # 明文必须常驻到文件移出列表，所以不能 LRU 淘汰；改为「到顶即停」并说清原因，
+    # 免得一次拖几百个大文件把磁盘撑爆还不知道发生了什么。
+    try:
+        incoming = os.path.getsize(path)
+    except OSError:
+        incoming = 0
+    if _plain_bytes + incoming > max_plain_bytes():
+        return Resolution(
+            None, None, STATE_FAILED,
+            "已解密的临时内容超过上限（%.1f GB），为避免占满磁盘已停止解密该文件；"
+            "请分批处理，或调大 WM_DLP_MAX_BYTES" % (max_plain_bytes() / 1024 ** 3))
+    if budget is None:
+        configured = _env_float("WM_DLP_BUDGET")
+        budget = DEFAULT_BUDGET if configured is None else configured
+    deadline = None if budget and budget <= 0 else time.monotonic() + budget
     dst = new_plaintext_path(path)
     try:
-        provider.decrypt(path, dst)
+        _call_decrypt(provider, path, dst, deadline)
     except DecryptError as exc:
         release(dst)
         return Resolution(None, None, STATE_FAILED, str(exc))
@@ -876,16 +1237,35 @@ def resolve(path: str) -> Resolution:
     if error:
         release(dst)
         return Resolution(None, None, STATE_FAILED, error)
+    with _state_lock:
+        try:
+            got = os.path.getsize(dst)
+        except OSError:
+            got = 0
+        _plain_bytes += got
+        _plain_sizes[os.path.abspath(dst)] = got  # 供 plaintext_problem 比对
     return Resolution(path, dst, STATE_DECRYPTED)
 
 
-def resolve_all(paths: List[str]) -> Tuple[List[Resolution], List[Resolution]]:
-    """批量解析：返回 ``(可用结果, 失败结果)`` —— 失败项**不影响**其它文件。"""
+def resolve_all(
+    paths: List[str],
+    budget: Optional[float] = None,
+    is_cancelled: "Optional[object]" = None,
+) -> Tuple[List[Resolution], List[Resolution]]:
+    """批量解析：返回 ``(可用结果, 失败结果)`` —— 失败项**不影响**其它文件。
+
+    ``is_cancelled`` 可选，是个 ``() -> bool``：返回 True 就**立刻停止**后续文件
+    （已解析的结果照常返回）。关窗、用户点取消都要能中断这条同步链路，否则拖
+    20 个加密文件就是几十分钟无响应。
+    """
     usable: List[Resolution] = []
     failed: List[Resolution] = []
+    cancelled = is_cancelled if callable(is_cancelled) else None
     for path in paths:
+        if cancelled is not None and cancelled():
+            break
         try:
-            result = resolve(path)
+            result = resolve(path, budget=budget)
         except Exception as exc:  # resolve 自身不该抛；真抛了也不能连累整批
             failed.append(Resolution(None, None, STATE_FAILED,
                                      f"加密探测异常：{type(exc).__name__}: {exc}"))

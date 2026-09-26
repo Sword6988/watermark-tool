@@ -88,20 +88,44 @@ def write_image(image: Image.Image, dst: str, params: Dict[str, object]) -> None
         return
     except Exception as exc:
         first = exc
-    remaining = dict(params)
+    # 先**逐个**试「只剥这一项」：这样能定位真凶（剥掉谁之后能存成功，就是谁的
+    # 问题），并把真正的因果关系写进日志。若三个单项都救不回来，才试「全剥」——
+    # 那是"保住水印"的最后手段，代价是全部元数据丢失，**必须记一条明显的警告**。
     for key in META_KEYS:
-        if key not in remaining:
+        if key not in params:
             continue
-        trial = {k: v for k, v in remaining.items() if k != key}
+        trial = {k: v for k, v in params.items() if k != key}
         try:
             image.save(dst, **trial)
         except Exception:
-            remaining = trial  # 不是它的问题，继续剥下一个
             continue
         print(f"[WARN] {key} 写入失败，已按不带 {key} 保存 {dst}：{first}",
               file=sys.stderr)
         return
+    if len(params) > 1:
+        try:
+            image.save(dst)
+        except Exception:
+            pass
+        else:
+            print(f"[WARN] 元数据（{'/'.join(k for k in META_KEYS if k in params)}）"
+                  f"写入失败，已按**不带任何元数据**保存 {dst}：{first}", file=sys.stderr)
+            return
+    # 全部失败：Pillow 可能已经建出一个 0 字节 / 半截文件，留在"已预定"的输出
+    # 路径上会让用户以为处理成功。清掉它，再由批处理把它记进失败清单。
+    _discard(dst)
     raise _friendly_save_error(dst, first) from first
+
+
+def _discard(dst: str) -> None:
+    """删除保存失败留下的残骸（0 字节 / 半截文件）。"""
+    try:
+        if os.path.isfile(dst):
+            os.remove(dst)
+            print(f"[WARN] 已删除保存失败的残骸：{dst}", file=sys.stderr)
+    except OSError as exc:
+        print(f"[WARN] 保存失败且残骸无法删除（请手动清理）：{dst}：{exc}",
+              file=sys.stderr)
 
 
 def _friendly_save_error(dst: str, exc: Exception) -> ValueError:
@@ -116,7 +140,7 @@ def _friendly_save_error(dst: str, exc: Exception) -> ValueError:
         reason = "图片超过 Pillow 的安全像素上限（请缩小图片或分批处理）"
     elif "exceed" in low or "too large" in low:
         reason = "图片尺寸超出该格式上限（宽 / 高不得超过 65500 像素）"
-    elif isinstance(exc, OSError) or isinstance(exc, PermissionError):
+    elif isinstance(exc, OSError):  # PermissionError 是 OSError 的子类，右半永远冗余
         reason = "目标路径不可写（权限不足 / 磁盘已满 / 文件被占用）"
     else:
         reason = "该格式无法保存当前像素模式"

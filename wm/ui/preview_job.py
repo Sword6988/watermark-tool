@@ -14,7 +14,7 @@ from typing import Callable, Optional, Tuple
 
 from PIL import Image
 
-from .. import media, render
+from .. import dlp, media, render
 from ..spec import WatermarkSpec
 
 
@@ -29,8 +29,14 @@ CANCELLED = object()
 def render_preview(
     path: str, page: int, spec: WatermarkSpec, canvas_w: int, canvas_h: int,
     is_cancelled: "Optional[Callable[[], bool]]" = None,
+    on_problem: "Optional[Callable[[str], None]]" = None,
 ) -> Tuple[Optional[Image.Image], int, int]:
     """渲染单页预览图（RGB）。
+
+    ``on_problem``：读取**之前**发现文件不可用（明文被删 / 被换 / 0 字节）时，
+    把一条**可直接展示**的原因交给调用方。默认错误是「文件无法打开或页面不存在」，
+    而"明文没了"和"文件本身坏了"在用户看来完全是两件事 —— 前者重新添加即可，
+    后者要换文件。不区分的话排查时毫无线索（见 ``wm.dlp.plaintext_problem``）。
 
     公式与 ``App._preview_worker`` 完全一致：``avail = max(40, canvas - 2*12)``，
     ``scale = min(avail_w/page_w, avail_h/page_h)`` 夹到 ``[0.02, 4.0]``，底图按
@@ -51,6 +57,15 @@ def render_preview(
         if is_cancelled is not None and is_cancelled():
             cancelled = True
         return cancelled
+
+    problem = dlp.plaintext_problem(path)
+    if problem:
+        if on_problem is not None:
+            try:
+                on_problem(problem)
+            except Exception:
+                pass
+        return None, 0, 0
 
     try:
         doc = media.Document(path)

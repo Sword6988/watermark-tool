@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 import traceback
 
@@ -57,11 +58,26 @@ def rotate_log(path: str, limit: int = ERROR_LOG_MAX_BYTES,
         pass
 
 def user_log_dir() -> str:
-    """可写日志目录：``%LOCALAPPDATA%\\WatermarkTool\\logs``（绝不写程序目录）。"""
+    """可写日志目录：``%LOCALAPPDATA%\\WatermarkTool\\logs``（绝不写程序目录）。
+
+    **创建失败必须吞掉**：受限账户、组策略重定向、漫游配置文件未就绪都会让
+    ``%LOCALAPPDATA%`` 不可写。而这个函数同时被「崩溃兜底」自己调用
+    （:func:`main` 的 except 分支第一行）—— 它一抛，兜底就跟着崩，表现为
+    **双击 exe 完全无反应**，连错误框都没有。所以失败时降级到系统临时目录。
+    """
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     d = os.path.join(base, APP_NAME, "logs")
-    os.makedirs(d, exist_ok=True)
-    return d
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        pass
+    fallback = os.path.join(tempfile.gettempdir(), APP_NAME, "logs")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+    except OSError:
+        pass  # 连临时目录都建不了：返回路径即可，后续写入各自吞错
+    return fallback
 
 
 def module_root() -> str:
@@ -84,7 +100,12 @@ class _FileWriter:
             with open(self._path, "a", encoding="utf-8", errors="replace") as f:
                 f.write(s)
         except OSError:
-            pass
+            try:
+                with open(self._path + ".%d" % os.getpid(), "a",
+                          encoding="utf-8", errors="replace") as f:
+                    f.write(s)
+            except OSError:
+                pass
         return len(s)
 
     def writelines(self, lines) -> None:
@@ -101,10 +122,29 @@ class _FileWriter:
         raise OSError("no fileno")
 
 
+def _prune_runtime_logs(directory: str, keep: int = 5) -> None:
+    """只保留最近 ``keep`` 份 runtime 日志（改成按 pid 分文件后会累积）。"""
+    try:
+        names = sorted((n for n in os.listdir(directory)
+                        if n.startswith("runtime-") and n.endswith(".log")),
+                       key=lambda n: os.path.getmtime(os.path.join(directory, n)),
+                       reverse=True)
+    except OSError:
+        return
+    for name in names[keep:]:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
 def install_stdio() -> None:
     if sys.stdout is not None and sys.stderr is not None:
         return
-    log = os.path.join(user_log_dir(), "runtime.log")
+    # 日志名带 pid：多实例并行时共用 runtime.log 会互相截断，排查时看到的是
+    # 两个进程交织的半句话。按 pid 分开写，谁写的谁的一目了然。
+    log = os.path.join(user_log_dir(), "runtime-%d.log" % os.getpid())
+    _prune_runtime_logs(os.path.dirname(log))
     try:
         open(log, "w", encoding="utf-8").close()  # 每会话清空，避免无限增长
     except OSError:
@@ -298,7 +338,13 @@ def gui_main(argv: list) -> int:
 
     application = ui_app.App(root)
 
-    files = [os.path.abspath(p) for p in argv[1:] if os.path.exists(p)]
+    # argv 已经是「待处理路径」列表（选项由 _split_argv 剥离）。
+    # 不存在的路径**必须提示**：静默滤掉会让人以为工具坏了（双击关联打开时
+    # 路径带引号/空格尤其容易踩）。
+    missing = [p for p in argv if not os.path.exists(p)]
+    files = [os.path.abspath(p) for p in argv if os.path.exists(p)]
+    if missing:
+        print("[WARN] 以下路径不存在，已忽略：" + "；".join(missing[:5]), file=sys.stderr)
     if files:
         application.add_files(files)
 
@@ -306,21 +352,82 @@ def gui_main(argv: list) -> int:
     return 0
 
 
-def main(argv: list) -> int:
-    install_stdio()
+def install_excepthooks() -> None:
+    """把**后台线程**的异常也写进日志。
+
+    默认只有主线程未捕获异常会走 ``sys.excepthook``；预览线程 / 批处理线程里
+    的异常既不打日志也不弹框 —— 用户看到的只是「预览一直不出来」，排查时
+    连一行线索都没有。这里统一接到 error.log（与主流程同一份）。
+    """
+    def _thread_hook(args) -> None:
+        try:
+            err = os.path.join(user_log_dir(), "error.log")
+            rotate_log(err)
+            with open(err, "a", encoding="utf-8") as f:
+                f.write("==== %s (thread %s) ====\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                           getattr(args.thread, "name", "?")))
+                f.write("".join(traceback.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback)) + "\n")
+        except Exception:
+            pass
+        try:
+            print("[ERROR] 后台线程异常：%s: %s"
+                  % (getattr(args.exc_type, "__name__", "?"), args.exc_value),
+                  file=sys.stderr)
+        except Exception:
+            pass
+
     try:
-        if "--selftest" in argv:
-            i = argv.index("--selftest")
-            out = argv[i + 1] if len(argv) > i + 1 else os.path.join(os.getcwd(), "selftest_out")
+        import threading
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
+
+def _split_argv(argv: list) -> Tuple[list, Optional[str]]:
+    """把 argv 拆成 ``(待处理文件, selftest 输出目录|None)``。
+
+    早先 ``"--selftest" in argv`` 是成员判断：``a.png --selftest`` 会因为
+    ``i+1`` 超界而把 a.png 也丢掉（且无任何提示）。这里按“第一个 -- 开头的
+    选项”切分，选项之后的参数才能被当成选项值。
+    """
+    files: list = []
+    selftest_out: Optional[str] = None
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--selftest":
+            selftest_out = argv[index + 1] if len(argv) > index + 1 \
+                else os.path.join(os.getcwd(), "selftest_out")
+            index += 2
+            continue
+        if item.startswith("--"):
+            print("[WARN] 忽略未知选项：%s" % item, file=sys.stderr)
+            index += 1
+            continue
+        files.append(item)
+        index += 1
+    return files, selftest_out
+
+
+def main(argv: list) -> int:
+    try:
+        # install_stdio 必须在 try 里：它依赖 user_log_dir()（要建目录），而
+        # 兜底逻辑在下面的 except —— 若在 try 之外抛出，就没人接得住了。
+        install_stdio()
+        install_excepthooks()
+        files, selftest_out = _split_argv(argv[1:])
+        if selftest_out is not None:
             # 自检**不走**下面的 GUI 报错路径：那里会弹模态框，在无头环境（打包脚本 /
             # CI）里会永久挂起。这里自己兜住异常，只写 stderr + 返回退出码。
             try:
-                return selftest(out)
+                return selftest(selftest_out)
             except Exception:
                 traceback.print_exc()
                 print("[SELFTEST] FAIL")
                 return 1
-        return gui_main(argv)
+        return gui_main(files)
     except Exception:
         err = os.path.join(user_log_dir(), "error.log")
         tb = traceback.format_exc()

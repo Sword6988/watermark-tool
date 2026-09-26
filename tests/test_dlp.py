@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import os
+import subprocess as _sp
 import sys
 import tempfile
+import time
 import unittest
 from typing import Dict, List, Optional
 
@@ -30,7 +32,16 @@ from wm.spec import WatermarkSpec
 from wm.ui import batch
 
 WHITE = (255, 255, 255)
-MAGIC = dlp.DEFAULT_MAGIC
+
+
+def _magic() -> bytes:
+    """当前生效的加密魔数。
+
+    不能直接写 ``MAGIC = dlp.DEFAULT_MAGIC``：那是**导入时**固化的常量，
+    一旦外部（或上游用例）设了 ``WM_DLP_MAGIC``，整份用例就会因为"写进去的
+    魔数"和"判定时读的魔数"不一致而全崩，且报错信息完全看不出原因。
+    """
+    return dlp.magic()
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +57,13 @@ def _make_root():
         raise unittest.SkipTest("需要 tkinterdnd2 / 可用显示环境：%s" % exc)
 
 
+def _png(tmp: str, name: str = "img.png") -> str:
+    """在 ``tmp`` 里写一张普通 PNG（未加密），返回路径。"""
+    path = os.path.join(tmp, name)
+    Image.new("RGB", (40, 30), WHITE).save(path)
+    return path
+
+
 def _png_bytes(size=(40, 30)) -> bytes:
     """生成一张 PNG 的原始字节（用作「明文」）。"""
     import io
@@ -57,7 +75,7 @@ def _png_bytes(size=(40, 30)) -> bytes:
 def _write_encrypted(path: str, payload: bytes) -> str:
     """写一个「加密文件」：加密魔数 + 明文内容（本用例里解密 = 剥掉前 3 字节）。"""
     with open(path, "wb") as handle:
-        handle.write(MAGIC + payload)
+        handle.write(_magic() + payload)
     return path
 
 
@@ -146,7 +164,7 @@ def test_dlp_add_files_decrypts_automatically():
             with open(plain, "rb") as handle:
                 assert handle.read() == payload, "明文内容必须正确"
             with open(secret, "rb") as handle:
-                assert handle.read() == MAGIC + payload, "原文件绝不能被改写"
+                assert handle.read() == _magic() + payload, "原文件绝不能被改写"
 
             document = media.Document(secret, read_path=plain)
             try:
@@ -388,7 +406,7 @@ def test_dlp_command_provider_never_touches_the_source():
             with open(dst, "rb") as handle:
                 assert handle.read() == payload, "应接管 <输入>.dec_ 形式的产物"
             with open(secret, "rb") as handle:
-                assert handle.read() == MAGIC + payload, "原文件必须保持密文"
+                assert handle.read() == _magic() + payload, "原文件必须保持密文"
             assert not os.path.exists(secret + ".dec_"), "不得在原文件旁留产物"
         finally:
             dlp.release(dst)
@@ -426,7 +444,7 @@ def test_dlp_lddec_is_auto_enabled_when_dec_exe_is_deployed():
         dlp.set_provider(previous)
 
 
-def test_dlp_find_lddec_prefers_lDDec_subdir_and_env_override():
+def test_dlp_find_lddec_prefers_lddec_subdir_and_env_override():
     """自动发现：环境变量优先，其次是 LDDec/、tools/LDDec/、程序目录本身。"""
     original_env = os.environ.get("WM_LDDEC_EXE")
     original_app_dir = dlp.app_dir
@@ -493,7 +511,7 @@ def test_dlp_lddec_calls_only_a_copy_and_never_a_directory():
                 assert os.path.isfile(target), "只接受**文件**，绝不能传目录"
                 with open(target, "rb") as handle:
                     data = handle.read()
-                assert data[:3] == MAGIC, "交给 dec.exe 的应是密文副本"
+                assert data[:3] == _magic(), "交给 dec.exe 的应是密文副本"
                 staged = target + ".dec_"
                 with open(staged, "wb") as handle:
                     handle.write(data[3:])
@@ -517,7 +535,7 @@ def test_dlp_lddec_calls_only_a_copy_and_never_a_directory():
             with open(dst, "rb") as handle:
                 assert handle.read() == payload, "应接管就地覆盖后的明文"
             with open(secret, "rb") as handle:
-                assert handle.read() == MAGIC + payload, "原文件必须保持密文"
+                assert handle.read() == _magic() + payload, "原文件必须保持密文"
             dlp.release(dst)
     finally:
         dlp.subprocess.run = original_run
@@ -568,7 +586,7 @@ def test_dlp_lddec_cmd_edition_works_without_config_json():
             finally:
                 dlp.release(dst)
             with open(secret, "rb") as handle:
-                assert handle.read() == MAGIC + payload, "原文件仍是密文"
+                assert handle.read() == _magic() + payload, "原文件仍是密文"
     finally:
         dlp.subprocess.run = original_run
         dlp.set_provider(previous)
@@ -727,3 +745,260 @@ def test_dlp_batch_reads_plaintext_but_names_output_from_source():
         assert done.get("succeeded") == 1 and not done.get("failed"), logs
         expected = os.path.join(tmp, "secret_水印版.png")
         assert os.path.isfile(expected), "输出必须落在原文件旁、沿用原文件名"
+
+
+# ---------------------------------------------------------------------------
+# 总预算 / 取消 / 上限 / 通道契约（P1 加固）
+# ---------------------------------------------------------------------------
+
+class _SlowProvider(dlp.DecryptProvider):
+    """每条通道都慢，且**尊重总预算**（真实通道也必须这么写）。"""
+
+    name = "slow"
+    label = "慢通道"
+
+    def __init__(self, seconds: float = 5.0) -> None:
+        self.seconds = seconds
+
+    def available(self) -> bool:
+        return True
+
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        time.sleep(dlp._budget_timeout(self.seconds, deadline))
+        raise dlp.DecryptError("慢通道超时")
+
+
+def test_dlp_total_budget_caps_the_whole_chain() -> None:
+    """三条通道各等满一次最坏 330 秒；总预算必须把整条链压在预算内。"""
+    previous = dlp.get_provider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+            chain = dlp.ChainProvider([_SlowProvider(), _SlowProvider(), _SlowProvider()])
+            dlp.set_provider(chain)
+            started = time.time()
+            result = dlp.resolve(secret, budget=0.3)
+            elapsed = time.time() - started
+            assert result.path is None
+            assert elapsed < 2.0, f"总预算没生效：耗时 {elapsed:.1f}s"
+            assert "预算" in result.message, result.message
+    finally:
+        dlp.set_provider(previous)
+
+
+def test_dlp_resolve_all_stops_when_cancelled() -> None:
+    """取消后不再处理后续文件（关窗 / 用户中断都要能叫停这条同步链路）。"""
+    previous = dlp.get_provider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # 必须是**加密**文件，否则 resolve 走「未加密直返」，根本不会调解密器
+            paths = [_write_encrypted(os.path.join(tmp, "p%d.png" % i), _png_bytes())
+                     for i in range(4)]
+            seen: List[str] = []
+
+            class _Counting(dlp.DecryptProvider):
+                name = "counting"
+
+                def available(self) -> bool:
+                    return True
+
+                def decrypt(self, src, dst, deadline=None) -> None:
+                    seen.append(src)
+                    with open(dst, "wb") as handle:
+                        handle.write(_png_bytes())
+
+            dlp.set_provider(_Counting())
+            usable, failed = dlp.resolve_all(paths, is_cancelled=lambda: len(seen) >= 2)
+            assert len(seen) == 2, f"取消后仍在继续：{len(seen)}"
+            assert len(usable) == 2, usable
+    finally:
+        dlp.set_provider(previous)
+
+
+def test_dlp_plain_bytes_budget_stops_further_decryption() -> None:
+    """明文必须常驻、不能 LRU 淘汰，所以改为「到顶即停」并说清原因。"""
+    previous = dlp.get_provider()
+    original_bytes = dlp._plain_bytes
+    original_env = os.environ.get("WM_DLP_MAX_BYTES")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+            dlp.set_provider(_CountingPlainProvider())
+            os.environ["WM_DLP_MAX_BYTES"] = "10"  # 任何正常文件都会超
+            result = dlp.resolve(secret)
+            assert result.path is None, "超上限必须停止解密而不是照解"
+            assert "上限" in result.message, result.message
+    finally:
+        dlp._plain_bytes = original_bytes
+        if original_env is None:
+            os.environ.pop("WM_DLP_MAX_BYTES", None)
+        else:
+            os.environ["WM_DLP_MAX_BYTES"] = original_env
+        dlp.set_provider(previous)
+
+
+class _CountingPlainProvider(dlp.DecryptProvider):
+    """总是产出可用明文（用于验证配额 / 清理等旁路逻辑）。"""
+
+    name = "counting-plain"
+
+    def available(self) -> bool:
+        return True
+
+    def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        with open(dst, "wb") as handle:
+            handle.write(_png_bytes())
+
+
+def test_dlp_powershell_truncates_instead_of_appending() -> None:
+    """OpenWrite 不截断会残留上一个文件的尾部；必须改用会截断的写法。"""
+    provider = dlp.PowershellProvider(timeout=5)
+    captured: Dict[str, object] = {}
+    original_run = dlp.subprocess.run
+
+    def _fake_run(argv, **kwargs):
+        captured["script"] = " ".join(str(a) for a in argv)
+        return _sp.CompletedProcess(argv, 0, b"", b"")
+
+    dlp.subprocess.run = _fake_run
+    try:
+        provider.available = lambda: True
+        provider._read_plaintext("in.bin", "out.bin", timeout=5)
+    except dlp.DecryptError:
+        pass
+    finally:
+        dlp.subprocess.run = original_run
+    script = str(captured.get("script", ""))
+    assert "WriteAllBytes" in script, f"未使用会截断的写入方式：{script}"
+    assert "OpenWrite" not in script, "OpenWrite 不截断，会残留上一段明文"
+
+
+def test_dlp_unknown_leftovers_are_cleaned_up() -> None:
+    """解密器留下的任何中间产物都要清掉 —— 不能只认 .dec_ / _dec 两个名字。"""
+    class _Messy(dlp.CmdTypeProvider):
+        """借**真实通道骨架**验证清理：自己只负责制造垃圾 + 产出明文。"""
+
+        name = "messy"
+
+        def available(self) -> bool:
+            return True
+
+        def _read_plaintext(self, work: str, dst: str,
+                            timeout: Optional[float] = None) -> None:
+            directory = dlp.plaintext_dir()
+            with open(os.path.join(directory, "junk.dec"), "wb") as handle:
+                handle.write(b"x" * 16)
+            with open(dst, "wb") as handle:
+                handle.write(_png_bytes())
+
+    previous = dlp.get_provider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = _write_encrypted(os.path.join(tmp, "x.png"), _png_bytes())
+            dlp.set_provider(_Messy())
+            result = dlp.resolve(secret)
+            assert result.state == dlp.STATE_DECRYPTED, result.message
+            leftovers = [n for n in os.listdir(dlp.plaintext_dir())
+                         if n.startswith("junk")]
+            assert not leftovers, f"解密器残骸没被清理：{leftovers}"
+            dlp.release(result.read_path)
+    finally:
+        dlp.set_provider(previous)
+
+
+def test_dlp_bad_command_template_is_reported_not_raised() -> None:
+    """引号未闭合的命令模板不能把整个添加批次打断（shlex 会抛 ValueError）。"""
+    original_env = os.environ.get("WM_DLP_DECRYPT_CMD")
+    # 末尾引号缺失 —— 非 posix 的 shlex.split 会抛 "No closing quotation"
+    os.environ["WM_DLP_DECRYPT_CMD"] = '"C:/Tools/dec.exe" "{src}'
+    try:
+        dlp.reset_provider()
+        provider = dlp.get_provider()
+        assert provider is not None
+        assert not provider.available(), "解析不了的模板必须判为不可用"
+        assert "引号" in provider.problem(), provider.problem()
+    finally:
+        if original_env is None:
+            os.environ.pop("WM_DLP_DECRYPT_CMD", None)
+        else:
+            os.environ["WM_DLP_DECRYPT_CMD"] = original_env
+        dlp.reset_provider()
+
+
+def test_dlp_timeout_env_applies_to_builtin_chain() -> None:
+    """WM_DLP_TIMEOUT 不能只在配了命令模板时生效（文档写的是「单文件解密超时」）。"""
+    original = os.environ.get("WM_DLP_TIMEOUT")
+    os.environ["WM_DLP_TIMEOUT"] = "7"
+    try:
+        dlp.reset_provider()
+        provider = dlp.get_provider()
+        assert isinstance(provider, dlp.ChainProvider), type(provider)
+        for channel in provider.providers:
+            assert channel.timeout == 7.0, f"{channel.name} 未应用超时：{channel.timeout}"
+    finally:
+        if original is None:
+            os.environ.pop("WM_DLP_TIMEOUT", None)
+        else:
+            os.environ["WM_DLP_TIMEOUT"] = original
+        dlp.reset_provider()
+
+
+# ---------------------------------------------------------------------------
+# M8：明文读取前校验（消费方：批处理 / 预览）
+# ---------------------------------------------------------------------------
+
+def test_dlp_plaintext_problem_accepts_valid_file() -> None:
+    """正常的明文路径必须判为可用（不是"凡校验必报错"）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _png(tmp)
+        assert dlp.plaintext_problem(path) is None, "正常文件不应报问题"
+        assert dlp.plaintext_problem("") is not None, "空路径必须报问题"
+
+
+def test_dlp_plaintext_problem_distinguishes_missing_and_replaced() -> None:
+    """明文被删 / 被换 / 变空三种情形都要有**可区分且可行动**的原因。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = os.path.join(tmp, "gone.png")
+        gone = dlp.plaintext_problem(missing) or ""
+        assert ("已失效" in gone or "已被移走" in gone) and "重新添加" in gone, \
+            f"不存在的文件应提示失效/被移走且给出下一步动作，实际：{gone}"
+
+        empty = os.path.join(tmp, "empty.png")
+        open(empty, "wb").close()
+        assert "0 字节" in (dlp.plaintext_problem(empty) or ""), \
+            "0 字节文件应点明为空"
+
+        # 模拟「本模块产出过明文、随后被换成别的内容」
+        real = _png(tmp, "real.png")
+        key = os.path.abspath(real)
+        dlp._plain_sizes[key] = os.path.getsize(real)
+        try:
+            with open(real, "wb") as handle:
+                handle.write(b"tampered!")
+            message = dlp.plaintext_problem(real) or ""
+            assert "大小已变化" in message, message
+        finally:
+            dlp._plain_sizes.pop(key, None)
+
+
+def test_dlp_batch_reports_plaintext_lost_instead_of_generic_open_error() -> None:
+    """批处理读到「明文没了」时，失败原因必须是那句具体提示，不是「无法打开」。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = _png(tmp)
+        missing = os.path.join(tmp, "已消失的明文.png")
+        logs: List[str] = []
+        done: List[object] = []
+
+        batch.run_batch([source], WatermarkSpec(), tmp,
+                        is_cancelled=lambda: False,
+                        on_progress=lambda *a: None,
+                        on_log=logs.append,
+                        on_done=lambda ok, failed, cancelled: done.append((ok, failed)),
+                        read_path=lambda _p: missing)
+
+        assert done, "on_done 必须送达"
+        ok, failed = done[0]
+        assert ok == 0 and len(failed) == 1, f"该文件应失败：{done[0]}"
+        reason = failed[0][1]
+        assert "已失效" in reason or "已被移走" in reason, \
+            f"失败原因应点明明文失效，实际：{reason}"

@@ -1,0 +1,217 @@
+"""核心基础设施单测：``wm/lru.py``、``wm/fonts.py``、``wm/ui/panel.py``。
+
+这三个模块此前**没有任何直接用例**（审计 M22）：缓存语义只在渲染路径里被间接
+覆盖，字体回退只在真机上"看着对"，滚动容器的销毁顺序更是完全没测。它们一旦退化，
+表现都是**偶发且难复现**的问题（缓存抖动、中文变豆腐块、销毁后 Tcl 报
+``invalid command name``），所以在这里按行为契约直接钉住。
+
+无 Tk 依赖的部分可在无显示环境运行；``panel`` 相关用例按现有约定抛
+``SkipTest``（**不**算通过）。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from wm.lru import SizedLRU
+
+
+# ---------------------------------------------------------------------------
+# wm/lru.py
+# ---------------------------------------------------------------------------
+
+def _cache(budget, **kw) -> SizedLRU:
+    """建一个「按字节长度计费」的缓存。"""
+    return SizedLRU(len, budget, **kw)
+
+
+def test_lru_is_true_lru_not_fifo() -> None:
+    """命中必须刷新次序：被复用的旧条目不能先被挤掉（旧实现是 FIFO，会误淘汰）。"""
+    cache = _cache(3)
+    cache.set("a", "x")   # 1 字节
+    cache.set("b", "x")
+    cache.set("c", "x")
+    assert cache.get("a") == "x", "刚放进去的条目应能取到"
+    cache.set("d", "x")   # 超限 → 淘汰最旧的
+    assert "a" in cache, "a 刚被命中，应视为最新的，不能被淘汰（FIFO 会错杀它）"
+    assert "b" not in cache, "b 是最旧的，应被淘汰"
+    assert len(cache) == 3, f"容量应回到 3，实际 {len(cache)}"
+
+
+def test_lru_oversized_entry_is_not_cached() -> None:
+    """单条就超预算时不入缓存（否则它会先把别人全清光、再被自己挤掉，反复重渲染）。"""
+    cache = _cache(5)
+    assert cache.set("big", "0123456789") is False, "超限条目不应入缓存"
+    assert len(cache) == 0, "未入缓存则条目数为 0"
+    assert cache.bytes == 0, f"字节账目也应保持 0，实际 {cache.bytes}"
+
+
+def test_lru_budget_can_be_callable_and_is_evaluated_lazily() -> None:
+    """预算可以是无参函数：测试把常量压小时才生效（构造时固化就会失效）。"""
+    state = {"budget": 10}
+    cache = _cache(lambda: state["budget"])
+    cache.set("k", "12345")
+    assert len(cache) == 1
+    state["budget"] = 2          # 运行时收紧预算
+    cache.set("k2", "1")
+    assert len(cache) <= 1, f"预算收紧后应触发裁剪，实际 {len(cache)}"
+
+
+def test_lru_overwrite_same_key_keeps_byte_account_exact() -> None:
+    """覆盖同键必须扣掉旧计量，否则字节账目会单调膨胀、误判超限。"""
+    cache = _cache(100)
+    cache.set("k", "aa")     # 2
+    cache.set("k", "bbbb")   # 覆盖为 4
+    assert cache.bytes == 4, f"覆盖后应为 4 字节，实际 {cache.bytes}"
+    assert len(cache) == 1, "同键只应有一条"
+
+
+def test_lru_min_keep_protects_newest_when_over_budget() -> None:
+    """``min_keep`` 保留最新那条 —— 渲染路径「先入缓存、再用」，裁它会拿到已释放对象。"""
+    cache = _cache(1, min_keep=1)
+    cache.set("old", "x")
+    cache.set("new", "x")
+    assert "new" in cache, "最新一条必须留住"
+    assert "old" not in cache, "最旧的应被裁掉"
+    assert cache.bytes <= 1, f"应压回预算内，实际 {cache.bytes}"
+
+
+def test_lru_concurrent_set_get_is_safe() -> None:
+    """并发读写不得抛异常（旧实现 ``next(iter(d.items()))`` 会随机 KeyError）。"""
+    cache = _cache(200)
+    errors: list = []
+
+    def worker(tag: int) -> None:
+        try:
+            for i in range(200):
+                key = ("k", i % 50)
+                cache.set(key, "x" * (i % 7 + 1))
+                cache.get(key)
+                cache.bytes
+        except Exception as exc:  # pragma: no cover - 只在出错时到这
+            errors.append("%d: %r" % (tag, exc))
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert not errors, "并发访问抛异常：%s" % errors[:3]
+    assert cache.bytes >= 0, f"字节账目不能为负：{cache.bytes}"
+    assert cache.bytes <= 200, f"必须落在预算内：{cache.bytes}"
+
+
+def test_lru_clear_resets_bytes_and_length() -> None:
+    """clear 必须把字节账目一起归零（切换文档时用，漏归零会让后续全部判超限）。"""
+    cache = _cache(100)
+    cache.set("a", "xx")
+    cache.set("b", "yyy")
+    assert cache.bytes == 5
+    cache.clear()
+    assert len(cache) == 0 and cache.bytes == 0, "clear 后条目与字节都应归零"
+
+
+# ---------------------------------------------------------------------------
+# wm/fonts.py
+# ---------------------------------------------------------------------------
+
+def test_fonts_resolve_returns_usable_font_file() -> None:
+    """``resolve`` 必须给到**存在**的字体文件；否则渲染层会静默排不出字。"""
+    from wm import fonts
+
+    info = fonts.resolve(None)
+    assert info is not None, "本机至少应有一个可用字体"
+    path, index = info
+    assert os.path.isfile(path), f"解析出的字体文件不存在：{path}"
+    assert isinstance(index, int) and index >= 0, f"ttc 索引非法：{index}"
+
+
+def test_fonts_pil_font_cache_is_bounded_and_reused() -> None:
+    """字体对象缓存必须有**条目上限**且按 (家族, 尺寸) 复用（旧实现到 128 条整表清空）。"""
+    from wm import fonts
+
+    fonts.clear_cache()
+    first = fonts.pil_font(None, 24)
+    again = fonts.pil_font(None, 24)
+    assert first is again, "相同 (家族, 尺寸) 应命中缓存返回同一对象"
+
+    for size in range(1000, 1000 + fonts._FONT_CACHE_CAP + 40):
+        fonts.pil_font(None, size)
+    assert len(fonts._font_cache) <= fonts._FONT_CACHE_CAP, \
+        f"缓存必须受上限约束，实际 {len(fonts._font_cache)} > {fonts._FONT_CACHE_CAP}"
+
+
+def test_fonts_can_render_cjk_returns_bool_and_caches() -> None:
+    """中文覆盖判定返回布尔并写缓存；未知家族不得抛异常。"""
+    from wm import fonts
+
+    fonts.clear_cache()
+    family = fonts.default_family()
+    assert isinstance(fonts.can_render_cjk(family), bool), "判定结果必须是布尔"
+    assert family in fonts._cjk_map, "判定结果应进缓存（否则每次都重新加载字体）"
+    # 未知家族不抛异常、且仍返回布尔。注意它**不是** False：``can_render_cjk``
+    # 内部走 ``resolve``，未知家族会回退到优先字体，于是结果是「回退后那个字体
+    # 能不能排中文」。本用例钉住的是「不抛异常 + 类型是布尔」，不是具体取值。
+    unknown = fonts.can_render_cjk("__NoSuchFont__")
+    assert isinstance(unknown, bool), f"未知家族也须返回布尔，实际 {unknown!r}"
+    assert fonts.can_render_cjk("") is False, "空家族名应判 False"
+
+
+def test_fonts_clear_cache_resets_all_caches() -> None:
+    """clear_cache 要同时清家族映射 / 字体对象 / 中文判定三张表。"""
+    from wm import fonts
+
+    fonts.pil_font(None, 20)
+    fonts.can_render_cjk(fonts.default_family())
+    assert len(fonts._font_cache) > 0
+    fonts.clear_cache()
+    assert len(fonts._font_cache) == 0, "字体对象缓存未清空"
+    assert len(fonts._cjk_map) == 0, "中文判定缓存未清空"
+
+
+# ---------------------------------------------------------------------------
+# wm/ui/panel.py
+# ---------------------------------------------------------------------------
+
+def test_panel_scrolled_frame_cancels_wheel_job_on_destroy() -> None:
+    """销毁时必须先撤掉滚轮合并定时器 —— 否则 16ms 后回调会碰已销毁的 canvas。
+
+    表现为 Tcl ``invalid command name ".!...canvas"``：窗口已经关了，控制台还在
+    刷错误，用户侧看就是"关窗后偶发报错"。
+    """
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+    except Exception as exc:
+        raise unittest.SkipTest("需要可用显示环境：%s" % exc)
+
+    try:
+        from wm.ui.panel import ScrolledFrame
+
+        root.geometry("320x240")
+        frame = ScrolledFrame(root)
+        frame.pack(fill="both", expand=True)
+        root.update_idletasks()
+        root.update()
+
+        frame.accumulate(120.0)          # 挂一个 16ms 后的合并回调
+        assert frame._wheel_job is not None, "累积滚动量后应挂上待执行的定时器"
+        frame.destroy()
+        assert frame._wheel_job is None, "destroy 必须撤掉定时器并清空句柄"
+
+        # 定时器真被撤掉的话，等它本该触发的时刻过后也不该有任何 Tcl 报错
+        root.update()
+        assert ScrolledFrame._LIVE_COUNT >= 0, "实例计数不应为负"
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass

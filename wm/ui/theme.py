@@ -42,8 +42,12 @@ def enable_dpi_awareness() -> float:
         except Exception:
             ctypes.windll.user32.SetProcessDPIAware()
         dc = ctypes.windll.user32.GetDC(0)
-        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)
-        ctypes.windll.user32.ReleaseDC(0, dc)
+        try:
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)
+        finally:
+            # ReleaseDC 必须在 finally 里：GetDeviceCaps 抛异常时旧写法会漏掉
+            # 一次释放（DC 是稀缺的全局资源，泄漏会累积）
+            ctypes.windll.user32.ReleaseDC(0, dc)
         SCALE = (dpi / 96.0) if dpi else 1.0
     except Exception:
         SCALE = 1.0
@@ -101,7 +105,7 @@ SLIDER_TRACK_EDGE = "#c2c6d0"   # 未填充轨道描边（让轨道在白底上�
 SLIDER_TRACK_OFF = "#e8eaef"    # 禁用态轨道
 SLIDER_FILL = ACCENT            # 已填充轨道（主题色，与未填充段强对比）
 SLIDER_FILL_OFF = "#c9ccd4"     # 禁用态已填充
-KNOB = "#ffffff"                # 滑块本体
+KNOB_FILL = "#ffffff"           # 滑块本体（与下面两个 KNOB_* 尺寸同名易混，故加后缀）
 KNOB_OFF = "#c6c6cf"            # 禁用态滑块
 KNOB_SHADOW = "#c8ccd6"         # 滑块投影（比本体暗，形成「浮起」感）
 TRACK_BAR = "#d5d7de"           # 进度条轨道
@@ -173,9 +177,12 @@ def round_rect(canvas: tk.Canvas, x0, y0, x1, y1, r=0, **kw):
     直边也会被画成微弯的曲线、整体发虚；这里改为「4 段直线 + 4 段真实
     圆弧逼近（每角 8 段，最大偏差 < 0.05px）」，边缘与调用方给的几何严格一致。
     """
+    # ``x1 < x0``（极窄窗口 / 尚未布局完）时 (x1-x0)/2 为负，min 会把 r 也带成
+    # 负数 —— 负半径画出来是反向 / 不可见的矩形。退化分支必须同时挡住负尺寸。
     r = min(float(r), (x1 - x0) / 2.0, (y1 - y0) / 2.0)
     if r <= 0:
-        return canvas.create_rectangle(x0, y0, x1, y1, **kw)
+        return canvas.create_rectangle(min(x0, x1), min(y0, y1),
+                                       max(x0, x1), max(y0, y1), **kw)
     # 屏幕系 y 向下：四角圆心 + 各自的起止角（-90°=正上，0°=正右，…）
     corners = (
         (x1 - r, y0 + r, -90.0, 0.0),     # 右上
@@ -360,7 +367,7 @@ class FlatScale(tk.Canvas):
 
     **为什么不用 ``ttk.Scale``**：ttk::scale 的 trough 是**单一元素**，根本没有
     「已填充部分」这个样式位（那是 Progressbar 才有的概念），滑块的直径 / 描边 /
-    投影在 clam 主题下也都改不动。这里沿用项目既有做法（开关 ``ToggleSwitch``、
+    投影在 clam 主题下也都改不动。这里沿用项目既有做法（开关、
     按钮 ``FluentButton`` 均为 Canvas 自绘）自己画，才能同时满足「对比更强」与
     「已填充 / 未填充可辨」两条要求。
 
@@ -369,7 +376,7 @@ class FlatScale(tk.Canvas):
 
     H = 20          # 控件总高（逻辑 px）
     TRACK = 6       # 轨道粗细
-    KNOB = 16       # 滑块直径
+    KNOB_DIAMETER = 16       # 滑块直径
     RING = 2        # 滑块描边宽
 
     def __init__(self, parent, from_: float = 0.0, to: float = 1.0,
@@ -398,7 +405,7 @@ class FlatScale(tk.Canvas):
 
     def _pad(self) -> float:
         """两端留半个滑块的余量，保证滑块在最值处也完整可见。"""
-        return px(self.KNOB) / 2.0
+        return px(self.KNOB_DIAMETER) / 2.0
 
     def _span(self) -> float:
         return max(1.0, self._cw - 2.0 * self._pad())
@@ -461,11 +468,11 @@ class FlatScale(tk.Canvas):
         else:
             track_c, edge_c = SLIDER_TRACK, SLIDER_TRACK_EDGE
             fill_c = SLIDER_FILL
-            knob_fill = ACCENT_SOFT if self._press else KNOB
+            knob_fill = ACCENT_SOFT if self._press else KNOB_FILL
             knob_line = ACCENT_DOWN if self._press else (ACCENT_HOVER if self._hover else ACCENT)
             shadow_c = KNOB_SHADOW
 
-        r = px(self.KNOB) / 2.0
+        r = px(self.KNOB_DIAMETER) / 2.0
         glow = not self._disabled and (self._hover or self._press)
         ring_w = px(self.RING)
 
@@ -550,7 +557,7 @@ class _AngleDial(tk.Canvas):
     """
 
     D = 64              # 圆盘直径（逻辑 px）
-    KNOB = 8            # 手柄半径
+    KNOB_RADIUS = 8            # 手柄半径
     ARROW_LEN = 8       # 箭头长度
     ARROW_HALF = 3.5    # 箭头半宽
     ARROW_GAP = 2       # 箭头与手柄之间的间隙
@@ -564,7 +571,7 @@ class _AngleDial(tk.Canvas):
                  **_ignored) -> None:
         # 圈外余量必须容得下「手柄半径 + 间隙 + 箭头长」：箭头画在手柄**外侧**，
         # 余量不足就会被后画的手柄盖住（原型第一版正是如此，箭头等于没有）。
-        self._room = px(self.KNOB) + px(self.ARROW_GAP) + px(self.ARROW_LEN) + px(2)
+        self._room = px(self.KNOB_RADIUS) + px(self.ARROW_GAP) + px(self.ARROW_LEN) + px(2)
         side = px(self.D) + self._room * 2
         super().__init__(parent, width=side, height=side, bg=bg,
                          highlightthickness=0, bd=0, cursor="hand2", takefocus=0)
@@ -692,13 +699,13 @@ class _AngleDial(tk.Canvas):
             knob_edge, knob_fill = DIAL_KNOB_EDGE_OFF, KNOB_OFF
         else:
             ring_c, line_c, arrow_c = DIAL_RING, DIAL_LINE, DIAL_ARROW
-            knob_edge, knob_fill = DIAL_KNOB_EDGE, KNOB
+            knob_edge, knob_fill = DIAL_KNOB_EDGE, KNOB_FILL
 
-        base = r + px(self.KNOB) + px(self.ARROW_GAP)
+        base = r + px(self.KNOB_RADIUS) + px(self.ARROW_GAP)
         tip = base + px(self.ARROW_LEN)
         over = px(self.LINE_OVER)
         half = px(self.ARROW_HALF)
-        kr = px(self.KNOB)
+        kr = px(self.KNOB_RADIUS)
         kx, ky = c + ux * r, c + uy * r
         glow = not self._disabled and (self._hover or self._press)
         shadow = KNOB_OFF if self._disabled else KNOB_SHADOW
@@ -1182,6 +1189,12 @@ class SliderField(tk.Frame):
         return self._value
 
     def set(self, value: float, notify: bool = True) -> None:
+        # **入口处**就挡住，而不是只在 _emit 里挡「通知」。
+        # 早先禁用态下滚轮 / 方向键 / 手输仍会改掉 ``_value`` 与界面文本，只有回调
+        # 被吞掉 —— 结果「框里显示 37、渲染用的是 12」，解冻后一碰参数就跳变。
+        # 与 ColorField._set、TextArea._on_modified 保持同一套做法。
+        if not self._enabled:
+            return
         value = self._snap(float(value))
         self._value = value
         if self.var is not None:
@@ -1207,80 +1220,6 @@ class SliderField(tk.Frame):
             # 禁用时收起可能的焦点环，避免"灰字段 + accent 边框"打架
             self._focused = False
             self._sync_box_border()
-
-
-class ToggleSwitch(tk.Frame):
-    """胶囊开关（开关在左、标签在右）。"""
-
-    W, H = 42, 22
-
-    def __init__(self, parent, text: str, command: Callable[[bool], None],
-                 value: bool = False, bg: str = PANEL) -> None:
-        super().__init__(parent, bg=bg)
-        self._command = command
-        self._value = bool(value)
-        self._hover = False
-        self._bg = bg
-        # 注意：属性名不能叫 _w / _h —— _w 是 tk.Misc 的**保留属性**（控件 Tcl 路径名），
-        # 覆盖它会让后续 self.delete(...) 之类调用报 "invalid command name"。
-        self._cw, self._ch = px(self.W), px(self.H)
-        self.canvas = tk.Canvas(self, width=self._cw, height=self._ch, bg=bg,
-                                highlightthickness=0, bd=0, cursor="hand2")
-        self.canvas.pack(side="left")
-        self.label = tk.Label(self, text=text, bg=bg, fg=TEXT_DIM,
-                              font=(UI_FAMILY, sf(9)), anchor="w")
-        self.label.pack(side="left", padx=(px(SP_SM), 0))
-        for widget in (self.canvas, self.label):
-            widget.bind("<Button-1>", self._toggle)
-            widget.bind("<Enter>", self._on_enter)
-            widget.bind("<Leave>", self._on_leave)
-        # 位图渲染依赖画布实际尺寸：映射前 winfo 是占位值，Configure 后重画一次
-        self.canvas.bind("<Configure>", lambda _e: self._redraw())
-        self._redraw()
-
-    def _toggle(self, _event=None) -> None:
-        self._value = not self._value
-        self._redraw()
-        if self._command is not None:
-            self._command(self._value)
-
-    def _on_enter(self, _event=None) -> None:
-        self._hover = True
-        self.canvas.configure(cursor="hand2")
-        self._redraw()
-
-    def _on_leave(self, _event=None) -> None:
-        self._hover = False
-        self._redraw()
-
-    def _redraw(self) -> None:
-        self.canvas.delete("all")
-        h = self._ch
-        if self._value:
-            track = ACCENT_HOVER if self._hover else ACCENT
-        else:
-            track = SWITCH_OFF_HOVER if self._hover else SWITCH_OFF
-        cw, ch, pad = self._cw, self._ch, px(2)
-        knob_d = ch - pad * 2
-        knob_x = (cw - pad - knob_d) if self._value else pad
-
-        def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
-            # 胶囊轨道：r = h/2 恰好是半圆端帽
-            d.rounded_rectangle([0, 0, s(cw), s(h)], radius=s(h / 2.0),
-                                fill=track, outline=track)
-            d.ellipse([s(knob_x), s(pad), s(knob_x + knob_d), s(pad + knob_d)],
-                      fill=KNOB)
-
-        paint_aa(self.canvas, paint, bg=self._bg)
-
-    def get(self) -> bool:
-        return self._value
-
-    def set(self, value: bool, notify: bool = False) -> None:
-        self._value = bool(value)
-        self._redraw()
-        if notify and self._command is not None:
-            self._command(self._value)
 
 
 class FluentButton(tk.Canvas):
@@ -1480,7 +1419,9 @@ class TextArea(tk.Frame):
                             padx=px(SP_SM), pady=px(SP_SM))
         self.text.pack(fill="both", expand=True)
         self.text.insert("1.0", value)
-        self.text.bind("<<Modified>>", self._on_modified)
+        # 只绑 ``<KeyRelease>``：``<<Modified>>`` 与之绑同一个处理器时，每次输入
+        # 会触发两次（一次来自 tk 的修改标记、一次来自按键），等于每次改动都多跑
+        # 一遍预览调度。
         self.text.bind("<KeyRelease>", self._on_modified)
 
     def set_enabled(self, enabled: bool) -> None:
@@ -1525,6 +1466,6 @@ class TextArea(tk.Frame):
 __all__ = [
     "SCALE", "enable_dpi_awareness", "px", "sf", "mix", "round_rect",
     "AA_SS", "paint_aa",
-    "install_ttk_styles", "section", "field_label", "SliderField", "ToggleSwitch",
+    "install_ttk_styles", "section", "field_label", "SliderField",
     "FluentButton", "ColorField", "TextArea", "UI_FAMILY",
 ]

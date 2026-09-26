@@ -101,7 +101,10 @@ def _discover() -> List[str]:
 PRELOAD_MODULES = (
     "numpy", "numpy.random", "numpy.linalg",
     "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont", "PIL.ImageFilter",
-    "fitz",
+    # 注意：``import fitz`` 自 PyMuPDF 1.28 起已弃用（将来会 ImportError），
+    # 项目代码统一用 ``import pymupdf as fitz``；这里的预导入也必须用新名，
+    # 否则 import fitz 只是把一个待废弃的兼容层拉进来，预热不到真正的模块。
+    "pymupdf",
 )
 
 

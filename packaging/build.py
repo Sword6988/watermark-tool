@@ -118,6 +118,28 @@ def main() -> int:
         raise SystemExit("[FAIL] %s 缺失，PDF 功能会在运行时报 DLL 错误" % dll)
     print("[OK] pymupdf 原生 DLL 就位")
 
+    # 4b) 拖拽扩展（tkdnd）与随包解密器必须真在包里。
+    #
+    # tkdnd 缺失时程序**能正常启动**（``gui_main`` 有 except 兜底退回普通 Tk），
+    # 只是拖放静默失效 —— 用户只会以为"这工具不能拖"，根本想不到是打包漏了文件。
+    # 这类"能跑但少个功能"的缺陷比崩溃更难发现，必须在这里拦住。
+    has_tkdnd = any(
+        os.path.isdir(os.path.join(internal, path, "tkdnd"))
+        for path in os.listdir(internal)
+    ) if os.path.isdir(internal) else False
+    if not has_tkdnd:
+        raise SystemExit("[FAIL] _internal 下未找到 tkdnd（拖拽扩展），"
+                         "拖放功能会静默失效")
+    print("[OK] 拖拽扩展 tkdnd 就位")
+
+    dec_src = os.path.join(ROOT, "tools", "LDDec", "dec.exe")
+    if os.path.isfile(dec_src):
+        dec_dst = os.path.join(internal, "tools", "LDDec", "dec.exe")
+        if not os.path.isfile(dec_dst):
+            raise SystemExit("[FAIL] 随包的 dec.exe 未进包（%s），"
+                             "加密文件将无法解密" % dec_dst)
+        print("[OK] 随包解密器 dec.exe 就位")
+
     # 5) 自检验收（退出码 + 报告无 [FAIL] 双重判定）
     accept_dir = os.path.join(BUILD, "_accept")
     proc = subprocess.run([EXE, "--selftest", accept_dir], timeout=600)

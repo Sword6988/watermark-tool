@@ -159,9 +159,20 @@ class Document:
                 source_image.close()
                 raise
             self.page_count = 1
-            self.exif_bytes = (normalized_exif.tobytes()
-                               if normalized_exif is not None and len(normalized_exif)
-                               else None)
+            # ``tobytes()`` 必须在 try 里：畸形 EXIF 会让它抛异常，而那时
+            # ``source_image`` 还没关闭 —— Windows 下句柄会一直锁住源文件，
+            # 后续删除 / 覆盖全部失败（表现为 WinError 32 且无日志）。
+            try:
+                self.exif_bytes = (normalized_exif.tobytes()
+                                   if normalized_exif is not None and len(normalized_exif)
+                                   else None)
+            except Exception:
+                try:
+                    source_image.close()
+                finally:
+                    if normalized_image is not source_image:
+                        normalized_image.close()
+                raise
             self._image_size = tuple(normalized_image.size)
             if normalized_image is source_image:
                 # 常态路径不保留打开的磁盘句柄（Windows 下会锁源文件）。取像素时
@@ -182,7 +193,11 @@ class Document:
         if self.kind == KIND_IMAGE:
             width, height = self._image.size if self._image is not None else self._image_size
             return float(width), float(height)
-        assert self._pdf is not None
+        if self._pdf is None:
+            # 不用 assert：冻结版以 -O 构建，assert 会被剔除，同样的错误在源码版
+            # 是清晰的 AssertionError、在 exe 里却退化成 'NoneType' 不可下标，
+            # 排查成本天差地别。
+            raise ValueError("PDF 文档未打开（或已关闭）")
         rect = self._pdf[index].rect
         return float(rect.width), float(rect.height)
 
@@ -196,7 +211,8 @@ class Document:
             with Image.open(self.read_path) as source_image:
                 source_image.seek(0)
                 return source_image.convert("RGB")
-        assert self._pdf is not None
+        if self._pdf is None:
+            raise ValueError("PDF 文档未打开（或已关闭）")
         page = self._pdf[index]
         pixmap = page.get_pixmap(dpi=dpi)
         if pixmap.alpha:

@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw
 
 from . import fonts
 from .lru import SizedLRU
-from .spec import LINE_SPACING, WatermarkSpec
+from .spec import LINE_SPACING, WatermarkSpec, normalize_color
 
 #: 平铺块数硬上限，防极端参数下块数爆炸卡死
 MAX_TILES = 4000
@@ -89,7 +89,13 @@ def margin_px(spec: WatermarkSpec, page_w: float, page_h: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _alpha_rgba(color: str, opacity: float) -> Tuple[int, int, int, int]:
-    """把 ``#rrggbb`` + 不透明度转成 RGBA 四元组。"""
+    """把颜色写法 + 不透明度转成 RGBA 四元组。
+
+    先过 :func:`wm.spec.normalize_color`：它认得 ``"red"`` 这类名字、也能统一
+    大小写与 ``#rgb`` 简写。渲染层自己再解析一遍十六进制，等于有两套口径
+    （面板认得的写法渲染层不认，静默变红）。
+    """
+    color = normalize_color(color)
     hex_color = color.lstrip("#")
     if len(hex_color) == 3:
         hex_color = "".join(ch * 2 for ch in hex_color)
@@ -126,7 +132,7 @@ def _draw_text_block(
     """把多行文字画到一张透明 RGBA 画布上（未旋转）。
 
     ``angle`` 只用于在分配画布前估算调用方旋转后的包围盒；实际旋转仍由
-    :func:`_render_block_bitmap` 完成。
+    :func:`render_block_bitmap` 完成。
 
     块四周的透明内边距压到最小 ``max(2, line_height * 0.08)``：唯一作用是规避
     ``rotate(expand=True)`` 重采样在块边缘的抗锯齿裁切，留白过大会让平铺变稀疏。
@@ -161,17 +167,24 @@ def _draw_text_block(
     return bitmap
 
 
-def _render_block_bitmap(spec: WatermarkSpec, size_px: float) -> Image.Image:
-    """取得指定字号下、旋转后的透明 RGBA 水印块（带缓存）。
+def render_block_bitmap(spec: WatermarkSpec, size_px: float,
+                        use_cache: bool = True) -> Image.Image:
+    """取得指定字号下、旋转后的透明 RGBA 水印块（默认带缓存）。
 
     缓存 key 由 :meth:`WatermarkSpec.block_key` 派生 —— 「哪些参数影响块像素」
     只在 spec 里枚举一次。
+
+    ``use_cache=False`` 用于**探针渲染**（:func:`block_geometry` 量墨迹 bbox 时
+    用 ``opacity=1.0`` 的副本）：探针与正式渲染的 key 不同（opacity 不同），会
+    让同一 (spec, 字号) 在缓存里存**两份等大位图**，大块场景驻留直接翻倍。
+    探针只取尺寸与 bbox，用完即弃，没有缓存价值。
     """
     fs = max(1.0, float(size_px))
     key = (spec.block_key(), round(fs, 3))
-    cached = _RENDER_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if use_cache:
+        cached = _RENDER_CACHE.get(key)
+        if cached is not None:
+            return cached
 
     font = fonts.pil_font(spec.font_family, fs)
     angle = float(spec.angle)
@@ -185,6 +198,8 @@ def _render_block_bitmap(spec: WatermarkSpec, size_px: float) -> Image.Image:
         # 必须改另一个（回归用 tests/test_angle_dial.py 的轴向断言守住）。
         bitmap = bitmap.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
+    if not use_cache:
+        return bitmap
     # 超大块**不进缓存**（否则单条就把预算撑爆、触发反复清仓），普通块按字节预算
     # 淘汰 —— 两件事都由 SizedLRU 内部完成，这里只管塞。
     _RENDER_CACHE.set(key, bitmap)
@@ -222,7 +237,8 @@ def block_geometry(
     if cached is not None:
         return cached
 
-    bitmap = _render_block_bitmap(probe_spec, fs)
+    # 探针**不进渲染缓存**：它与正式渲染只差 opacity，缓存两份等大位图纯属浪费
+    bitmap = render_block_bitmap(probe_spec, fs, use_cache=False)
     bbox = bitmap.getchannel("A").getbbox()
     if not bbox or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
         bbox = (0, 0, bitmap.size[0], bitmap.size[1])
@@ -306,7 +322,23 @@ def compute_placements(
         if len(xs) * len(ys) <= MAX_TILES:
             break
         extra = (extra if extra > 0 else iw + 2.0 * margin) * 1.35
+    # 回退不收敛时**必须仍然守住建顶**（极端参数下 16 轮后仍可能超限，实测
+    # 20000×20000 + 退化墨迹 2×2 → 21609 块）。按均匀跨步抽稀：网格仍是等距的，
+    # 视觉上依旧是平铺，只是更稀 —— 总比让块数无上限地吃掉内存和时间好。
+    xs = _decimate(xs, len(ys), MAX_TILES)
+    ys = _decimate(ys, len(xs), MAX_TILES)
     return [(x - ix0, y - iy0) for y in ys for x in xs]
+
+
+def _decimate(values: List[float], other_count: int, limit: int) -> List[float]:
+    """均匀抽稀 ``values``，使 ``len(values) * other_count <= limit``。"""
+    if other_count <= 0 or limit <= 0:
+        return values
+    allowed = max(1, limit // other_count)
+    if len(values) <= allowed:
+        return values
+    step = len(values) / float(allowed)
+    return [values[int(i * step)] for i in range(allowed)]
 
 
 def clear_caches() -> None:
