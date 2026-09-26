@@ -14,8 +14,9 @@
    由 ``_smoke/dial_clockwise_probe.py`` 做端到端主轴比对兜底；
 3. **循环量语义**：接缝只出现在 ±180（文字倒置，最少用），跨 0° 必须**连续**
    （旧值域 0–360 把接缝压在 0° 上，拖过就 359->0 横跳，已修）；越界一律钳制；
-4. 三档吸附：**默认 5°、Shift 15°、Alt 不吸附**（半径 40px 时 1px ≈ 1.43°，
-   自由拖根本停不住想要的整数）；圆心死区内**按下与拖动全程**都不取值；
+4. **吸附 5°**，且**只此一档** —— Shift 15° / Alt 自由两档已按用户要求移除
+   （隐藏按键没人发现，精确值用数字框）；半径 40px 时 1px ≈ 1.43°，自由拖根本
+   停不住想要的整数；圆心死区内**按下与拖动全程**都不取值；
 5. 禁用态更淡且完全不响应；
 6. ``set()`` **不**回调 command（与 ttk.Scale / FlatScale 行为一致，
    否则 ``SliderField.set`` 里的显式 ``_emit()`` 会变成重复通知）。
@@ -247,32 +248,29 @@ def test_dial_is_cyclic_and_never_escapes_range():
         root.destroy()
 
 
-def test_dial_snap_tiers_and_center_is_dead():
-    """三档吸附：默认 5° / Shift 15° / Alt 不吸附；圆心死区全程不取值。"""
+def test_dial_snap_and_center_is_dead():
+    """吸附 5°（**唯一一档**，无修饰键）；圆心死区全程不取值。"""
     root = _root()
     try:
         dial, calls = _make_dial(root)
 
-        # 默认：吸附到 5° 的整数倍（半径 40px 时 1px ≈ 1.43°，自由拖停不住整数）
+        # 吸附到 5° 的整数倍（半径 40px 时 1px ≈ 1.43°，自由拖停不住整数）
         for probe, expect in ((37, 35), (53, 55), (7, 5), (98, 100)):
             x, y = _pts(dial, probe)
             dial._on_press(_Ev(x, y))
             got = dial.get()
-            assert abs(got - expect) <= 1e-9, f"{probe}° 默认应吸附到 {expect}，实际 {got!r}"
+            assert abs(got - expect) <= 1e-9, f"{probe}° 应吸附到 {expect}，实际 {got!r}"
 
-        # Alt（掩码 0x8）：不吸附，落在哪儿是哪儿
-        x, y = _pts(dial, 37)
-        dial._on_press(_Ev(x, y, state=dial.ALT_MASK))
-        raw = dial.get()
-        assert abs(raw - 37) < 1.5, raw
-
-        # 带 Shift（掩码 0x1）：吸附到 15° 的整数倍（就近取整：98 更近 105 而非 90）
-        for probe, expect in ((37, 30), (53, 60), (7, 0), (98, 105)):
-            x, y = _pts(dial, probe)
-            dial._on_press(_Ev(x, y, state=0x1))
-            got = dial.get()
-            assert abs(got - expect) <= 1e-9, f"{probe}° + Shift 应吸附到 {expect}，实际 {got!r}"
-            assert abs(got % 15) < 1e-9, "吸附结果必须是 15 的整数倍"
+        # **修饰键必须无效**（Shift 15° / Alt 自由 1° 两档已按用户要求移除）：
+        # 带不带修饰键结果要完全一致，否则就是死灰复燃。
+        for mask, name in ((0x0001, "Shift"), (0x0008, "Alt"), (0x0009, "Shift+Alt")):
+            x, y = _pts(dial, 37)
+            dial._on_press(_Ev(x, y))
+            plain = dial.get()
+            dial._on_press(_Ev(x, y, state=mask))
+            assert dial.get() == plain, f"{name} 不应改变吸附结果：{dial.get()!r} != {plain!r}"
+        assert not hasattr(dial, "SNAP_SHIFT"), "SNAP_SHIFT 常量应已移除"
+        assert not hasattr(dial, "ALT_MASK"), "ALT_MASK 常量应已移除"
 
         # 圆心死区：按下应完全被忽略（值不变、也不回调）
         c = dial._center()

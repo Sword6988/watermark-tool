@@ -520,7 +520,9 @@ class _AngleDial(tk.Canvas):
     相接，拖过头就是绕回来 —— 形状本身就在表达"这是循环量"。
 
     **方向线不是装饰**：它贯穿圆心、两端各探出圈外一小段，方向就是水印文字的
-    真实走向（0° 水平向右，逆时针为正，与 ``PIL.Image.rotate`` 的正方向一致）。
+    真实走向（0° 水平向右，**顺时针为正**，与读时钟同向）。注意 PIL 的
+    ``rotate`` 是逆时针，故 ``wm.layout`` 渲染时传 ``rotate(-angle)`` 补偿 ——
+    那边漏了负号，盘上的线就会与文字反着来。
     于是「角度」这个抽象数字变成了一眼就能看懂的方向预览。
 
     ==========  ==========================================================
@@ -531,11 +533,13 @@ class _AngleDial(tk.Canvas):
                 对称」的歧义 —— θ 与 θ+180° 画出来是同一条线，靠箭头区分
     ==========  ==========================================================
 
-    交互：拖动手柄转角度。**默认吸附 5°** —— 半径 40px 时 1px ≈ 1.43°，自由拖
+    交互：拖动手柄转角度。**吸附 5°** —— 半径 40px 时 1px ≈ 1.43°，自由拖
     几乎停不住想要的整数（容差只有 0.35px），而角度差 1° 视觉上根本看不出来，
-    所以默认给一个能稳定命中 0 / 30 / 45 的粗粒度；按住 **Shift** 吸附 15°
-    （对齐平铺角度），按住 **Alt** 关闭吸附回到 1° 自由。要精确到某一度就用
-    数字框 + 步进三角（那里始终是 1°）。
+    所以给一个能稳定命中 0 / 30 / 45 的粗粒度。要精确到某一度就用数字框 +
+    步进三角（那里始终是 1°）。
+
+    吸附**不挂修饰键**：早先做过 Shift 15° / Alt 自由 1° 两档，用户明确要求移除
+    —— 隐藏按键没人发现，同样的精度用数字框能直接拿到。故这里只有一档。
 
     靠近圆心（``DEAD_RATIO``）**按下与拖动全程都不取值**：那里的方向对位移的
     敏感度趋于无穷（0.2 半径处 1px ≈ 7.2°），强行取值就是数字疯跳。
@@ -550,13 +554,9 @@ class _AngleDial(tk.Canvas):
     ARROW_HALF = 3.5    # 箭头半宽
     ARROW_GAP = 2       # 箭头与手柄之间的间隙
     LINE_OVER = 6       # 方向线负方向探出圈外的长度（让它读起来像"轴"而非"射线"）
-    #: 吸附粒度三档：默认 5°（见类注释里的 1.43°/px 推导）、Shift 15°、Alt 不吸附。
-    #: 角度是"看个方向"的量，5° 一格既好命中常用角，又不至于让用户觉得失控。
+    #: 吸附粒度（见类注释里的 1.43°/px 推导）：角度是"看个方向"的量，5° 一格
+    #: 既好命中常用角，又不至于让用户觉得失控。只有一档，不挂修饰键。
     SNAP_DEFAULT = 5.0
-    SNAP_SHIFT = 15.0
-    # Tk 的修饰键掩码：Shift=1，Alt 在 Windows 上是 Mod1=8（Tk 文档约定）
-    SHIFT_MASK = 0x0001
-    ALT_MASK = 0x0008
     DEAD_RATIO = 0.45   # 圆心死区（占半径比例）：全程（按下 + 拖动）都不取值
 
     def __init__(self, parent, from_: float = 0.0, to: float = 360.0,
@@ -671,12 +671,9 @@ class _AngleDial(tk.Canvas):
         if self._in_dead_zone(event.x, event.y):
             return
         value = self._value_of(event.x, event.y)
-        if event.state & self.ALT_MASK:        # Alt：不吸附，交给 quantize 按步长取整
-            pass
-        elif event.state & self.SHIFT_MASK:    # Shift：15°（对齐平铺角度）
-            value = round(value / self.SNAP_SHIFT) * self.SNAP_SHIFT
-        else:                                  # 默认：5°，好命中 0 / 30 / 45
-            value = round(value / self.SNAP_DEFAULT) * self.SNAP_DEFAULT
+        # 吸附 5°：好命中 0 / 30 / 45。只有一档 —— 修饰键（Shift/Alt）方案已移除，
+        # 隐藏按键没人发现，要精确到某一度用数字框 + 步进三角即可。
+        value = round(value / self.SNAP_DEFAULT) * self.SNAP_DEFAULT
         if self._quantize is not None:
             value = self._quantize(value)
         self._value = min(max(value, self._lo), self._hi)
