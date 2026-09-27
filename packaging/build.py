@@ -16,10 +16,12 @@
 本机存在批量删除保护（阈值 50/回合），rmtree 会让脚本无声卡住。
 """
 import os
+import re
 import subprocess
 import sys
 import time
 import zipfile
+from typing import Dict, List, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,13 +32,28 @@ APP_DIR = os.path.join(DIST, "WatermarkTool")
 EXE = os.path.join(APP_DIR, "WatermarkTool.exe")
 SPEC = os.path.join(HERE, "watermark-dir.spec")
 
+#: 一轮构建共用同一枚时间戳后缀，便于 :func:`prune_obsolete` 按「**轮次**」计数。
+#: 一轮会挪进多个产物（目录版 = 应用目录 + zip；单文件版 = exe + pyi-one 中间目录），
+#: 若各自调 ``time.strftime`` 就可能跨秒，分组错乱、保留策略跟着失效。
+_STAMP = time.strftime("%H%M%S")
+
 
 def move_aside(path: str) -> None:
-    """把旧产物移进 build/_obsolete/<名>_<时间戳>（不删除）。"""
+    """把旧产物移进 build/_obsolete/<名>_<时间戳>（不删除）。
+
+    同轮构建的多个产物共用 :data:`_STAMP`，清理时才能整轮一起识别 ——
+    否则「一轮占掉多个名额」，稳态保留量会随产物个数漂移。
+    """
     if not os.path.exists(path):
         return
     os.makedirs(OBSOLETE, exist_ok=True)
-    target = os.path.join(OBSOLETE, "%s_%s" % (os.path.basename(path), time.strftime("%H%M%S")))
+    base = "%s_%s" % (os.path.basename(path), _STAMP)
+    target = os.path.join(OBSOLETE, base)
+    # 同名兜底：同一秒内反复构建会撞名（Windows 上 os.rename 覆盖不了已存在的目录）
+    n = 0
+    while os.path.exists(target):
+        n += 1
+        target = os.path.join(OBSOLETE, "%s-%d" % (base, n))
     os.rename(path, target)
     print("[OK] 旧产物移走 -> %s" % target)
 
@@ -68,8 +85,37 @@ def _rmtree_guarded(path: str) -> None:
         print("[WARN] 清理 %s 失败：%r" % (path, exc))
 
 
+def _obsolete_rounds() -> List[Tuple[float, List[str]]]:
+    """把 ``build/_obsolete/`` 的条目按**构建轮次**分组。
+
+    一轮构建可能挪进多个产物，它们共用 :data:`_STAMP` 后缀，据此归为一组。
+    认不出时间戳的历史条目按自身 mtime 各自成组（不会因此被误删成一堆）。
+
+    返回 ``[(该轮最新 mtime, [绝对路径, ...]), ...]``，按 mtime **升序**。
+    """
+    groups: Dict[str, List[str]] = {}
+    for name in os.listdir(OBSOLETE):
+        path = os.path.join(OBSOLETE, name)
+        m = re.search(r"_(\d{6})(?:-\d+)?$", name)
+        key = m.group(1) if m else "?%s" % name  # 无时间戳：自成一组
+        groups.setdefault(key, []).append(path)
+    rounds = []
+    for paths in groups.values():
+        try:
+            newest = max(os.path.getmtime(p) for p in paths)
+        except OSError:
+            continue
+        rounds.append((newest, paths))
+    rounds.sort(key=lambda item: item[0])
+    return rounds
+
+
 def prune_obsolete(keep: int = 2) -> None:
-    """保留 ``build/_obsolete/`` 中 mtime 最新的 ``keep`` 个，删除其余以腾空间。
+    """保留 ``build/_obsolete/`` 最*近* ``keep`` **轮**构建，删除其余以腾空间。
+
+    按「轮次」而非「条目」计数是关键：一轮构建会挪进**多个**产物（单文件版是
+    exe + pyi-one 中间目录）。若按条目计数，一轮就占掉多个名额，稳态保留量会
+    随产物个数漂移 —— 曾经就是因此锁死在 4 个条目（约 136MB）上。
 
     绝不进程内 rmtree：每个待删项都经 ``_rmtree_guarded`` 子进程删除。
     目录不存在时静默 no-op；任何异常都只报 WARN，绝不把构建打断。
@@ -77,18 +123,18 @@ def prune_obsolete(keep: int = 2) -> None:
     try:
         if not os.path.isdir(OBSOLETE):
             return
-        entries = [e for e in os.listdir(OBSOLETE)]
-        if len(entries) <= keep:
-            print("[OK] 清理 _obsolete：保留 %d 个，删除 0 个" % len(entries))
+        rounds = _obsolete_rounds()
+        if len(rounds) <= keep:
+            print("[OK] 清理 _obsolete：保留 %d 轮，删除 0 轮" % len(rounds))
             return
-        full = [os.path.join(OBSOLETE, e) for e in entries]
-        full.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        keep_paths = full[:keep]
-        del_paths = full[keep:]
-        for p in del_paths:
-            _rmtree_guarded(p)
-        print("[OK] 清理 _obsolete：保留 %d 个，删除 %d 个"
-              % (len(keep_paths), len(del_paths)))
+        del_rounds = rounds[:len(rounds) - keep]          # rounds 已升序，删最旧的
+        removed = 0
+        for _, paths in del_rounds:
+            for p in paths:
+                _rmtree_guarded(p)
+                removed += 1
+        print("[OK] 清理 _obsolete：保留 %d 轮，删除 %d 轮（%d 项）"
+              % (keep, len(del_rounds), removed))
     except Exception as exc:
         print("[WARN] 清理 _obsolete 失败：%r" % exc)
 
