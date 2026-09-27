@@ -336,3 +336,51 @@ def test_plain_pdf_is_not_mistaken_for_password_protected() -> None:
             assert width > 0 and height > 0, (width, height)
         finally:
             doc.close()
+
+
+# ---------------------------------------------------------------------------
+# 序列化版本号（审计 P2：from_dict 加版本号）
+# ---------------------------------------------------------------------------
+
+
+def test_to_dict_writes_current_schema_version() -> None:
+    """``to_dict`` 必须带上当前格式版本，且不把「来源版本」原样写回去。"""
+    from wm.spec import SCHEMA_VERSION, WatermarkSpec
+
+    data = WatermarkSpec(text="机密").normalized().to_dict()
+    assert data.get("version") == SCHEMA_VERSION, data.get("version")
+    assert "schema_version" not in data, data  # 来源信息不是参数，不该回写
+
+
+def test_from_dict_roundtrip_and_schema_version_recorded() -> None:
+    """往返后参数一致，且来源版本被记录（能被判断「是否来自更新版本」）。"""
+    from wm.spec import SCHEMA_VERSION, WatermarkSpec
+
+    spec = WatermarkSpec(text="机密", font_pct=4.0).normalized()
+    restored = WatermarkSpec.from_dict(spec.to_dict())
+    assert restored == spec, (restored, spec)
+    assert restored.schema_version == SCHEMA_VERSION, restored.schema_version
+
+
+def test_from_dict_tolerates_legacy_and_future_data() -> None:
+    """旧数据（无版本号）照常加载；未来版本保留已知字段、来源可被识别。
+
+    这两条都是**向后兼容**的底线：老配置不能因为多了个 version 就加载失败，
+    新配置也不能因为本地认不出字段就把整份参数丢掉。
+    """
+    from wm.spec import SCHEMA_VERSION, WatermarkSpec
+
+    spec = WatermarkSpec(text="机密", font_pct=4.0).normalized()
+    data = spec.to_dict()
+
+    legacy = dict(data)
+    legacy.pop("version")
+    old = WatermarkSpec.from_dict(legacy)
+    assert old == spec and old.schema_version is None, (old, old.schema_version)
+
+    future = dict(data, version=SCHEMA_VERSION + 1, brand_new_field=123)
+    new = WatermarkSpec.from_dict(future)
+    assert new == spec, (new, spec)                    # 未知字段丢弃，已知字段保留
+    assert new.schema_version == SCHEMA_VERSION + 1    # 来源版本留痕，不再静默
+    # 版本号绝不能参与缓存指纹：否则同一份参数会因"来自哪个版本"而重复渲染
+    assert new.render_key() == spec.render_key()

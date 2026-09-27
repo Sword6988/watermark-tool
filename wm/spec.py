@@ -16,8 +16,8 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # Pillow 用于把任意颜色写法归一化成 #rrggbb
     from PIL import ImageColor
@@ -169,6 +169,18 @@ def normalize_color(value: Any) -> str:
     return DEFAULT_COLOR
 
 
+#: ``WatermarkSpec`` 序列化格式的版本号。
+#:
+#: **只在字段语义发生变化时才递增**（改名、改单位、改取值范围、删除字段）。
+#: 新增字段不必递增 —— 老程序遇到未知字段会丢弃并用默认值，这本来就是安全的
+#: 向前兼容。
+#:
+#: 目前程序**不做参数持久化**（只在本模块内部与测试间往返），这个版本号是为将来
+#: 引入「保存 / 载入参数」准备的契约：没有它，读到一份更新的配置时无法区分
+#: 「这份配置本来就少一个字段」和「这份配置来自新版本，本地不认识」。
+SCHEMA_VERSION = 1
+
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -188,6 +200,15 @@ class WatermarkSpec:
     angle: float = DEFAULT_ANGLE
     opacity: float = DEFAULT_OPACITY
     color: str = DEFAULT_COLOR
+
+    #: 数据来源的**格式版本**，只由 :meth:`from_dict` 写入（``None`` = 未知 /
+    #: 本程序还没有版本号时写出的旧数据）。
+    #:
+    #: 刻意**不参与**相等比较、不进 :meth:`block_key` / :meth:`render_key`、
+    #: 也不会被 :meth:`to_dict` 原样写回（写回的是当前版本 :data:`SCHEMA_VERSION`）。
+    #: 它只服务于一个目的：**让"数据来自更新的程序"这件事不再静默** —— 那份数据
+    #: 里的新字段本地认不出会被丢弃，若无人知晓，用户只会看到"某个参数莫名失效"。
+    schema_version: Optional[int] = field(default=None, compare=False, repr=False)
 
     # -- 派生 -------------------------------------------------------------
 
@@ -264,21 +285,45 @@ class WatermarkSpec:
     # -- 序列化 -----------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
-        """导出为可 JSON 化的字典。"""
-        return dataclasses.asdict(self)
+        """导出为可 JSON 化的字典，并带上 :data:`SCHEMA_VERSION` 作为 ``version``。
+
+        ``schema_version`` 本身不写回（它是"来源"信息，不是参数），写回的是本程序
+        当前能产出的格式版本 —— 这样一份数据无论转手几次，都能被追溯到它是按
+        哪个版本的语义写出的。
+        """
+        data = dataclasses.asdict(self)
+        data.pop("schema_version", None)
+        data["version"] = SCHEMA_VERSION
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WatermarkSpec":
-        """从字典构造并合法化；字段缺失 / 非法不抛异常。"""
+        """从字典构造并合法化；字段缺失 / 非法 / 类型不对都**不抛异常**。
+
+        版本号的三种情况：
+
+        * ``version`` 缺失或非整数 —— 旧数据（还没有版本号时写出的），按当前格式
+          尽力加载，:attr:`schema_version` 记为 ``None``；
+        * ``version`` 等于 :data:`SCHEMA_VERSION` —— 正常加载；
+        * ``version`` 更高 —— 数据来自**更新的**程序。已知字段照常加载，未知字段
+          丢弃（这是唯一安全的做法），来源版本记在 :attr:`schema_version` 上，
+          调用方可据此提示"这份参数来自更新的版本"。
+
+        向后兼容的行为**不变**：未知字段依然静默丢弃、缺失字段依然取默认值 ——
+        版本号只是让"读取了未来数据"这件事有了痕迹。
+        """
         base = cls()
         if not isinstance(data, dict):
             return base
-        fields = {f.name for f in dataclasses.fields(cls)}
+        fields = {f.name for f in dataclasses.fields(cls)} - {"schema_version"}
         kwargs = {k: v for k, v in data.items() if k in fields}
         try:
-            return cls(**kwargs).normalized()
+            spec = cls(**kwargs).normalized()
         except Exception:
             return base
+        version = data.get("version")
+        spec.schema_version = version if isinstance(version, int) else None
+        return spec
 
     @classmethod
     def default(cls) -> "WatermarkSpec":
@@ -288,6 +333,7 @@ class WatermarkSpec:
 
 __all__ = [
     "WatermarkSpec",
+    "SCHEMA_VERSION",
     "DEFAULT_TEXT",
     "DEFAULT_FONT_FAMILY",
     "DEFAULT_SUFFIX",
