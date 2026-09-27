@@ -60,6 +60,9 @@ def _load_dlp():
 
 
 dlp, DLP_FROM = _load_dlp()
+#: 是否按文件路径单独加载（而非以 ``wm`` 包导入）：此时 ``wm.media`` 用不了，
+#: "原路径能不能直读"这条判据不可信，输出里要显式说明。
+STANDALONE = not DLP_FROM.startswith("wm.dlp")
 
 
 def sha256(path: str) -> str:
@@ -114,8 +117,15 @@ def probe(path: str, repeat: int) -> None:
     print("  文件头     ：%s" % head(path))
     print("  判为加密   ：%s" % dlp.is_encrypted(path))
     readable = dlp.probe_readable(path)
-    print("  按原路径打开：%s" % ("可以（读到的就是明文，说明已在白名单里）"
-                                 if readable is None else "失败 —— " + readable))
+    if readable is None:
+        print("  按原路径打开：可以（读到的就是明文，说明已在白名单里）")
+    elif "文件解析模块不可用" in readable and STANDALONE:
+        # 单独拷出 dlp.py 时 media 导入不了，这条判据必然失败 —— 不是本机的真实行为
+        print("  按原路径打开：%s" % readable)
+        print("                ^ 独立加载 dlp.py 时的正常现象（缺 wm.media），"
+              "**不代表 exe 里的行为**：真实 exe 会真的试着打开一次")
+    else:
+        print("  按原路径打开：失败 —— %s" % readable)
 
     before = sha256(path)
 
@@ -128,6 +138,9 @@ def probe(path: str, repeat: int) -> None:
 
     exe = dlp.find_lddec()
     print("  dec.exe    ：%s" % (exe or "未找到（LDDec 通道不参与）"))
+    if not exe:
+        print("                ^ 想单独验证 LDDec 通道：把 dec.exe 拷到本目录后，"
+              "用 set WM_LDDEC_EXE=<完整路径> 再跑一次")
 
     channels = list(getattr(provider, "providers", [provider]))
     print("  ---- 逐通道强制单独尝试（顺序 = 回退优先级）----")
@@ -149,6 +162,9 @@ def probe(path: str, repeat: int) -> None:
         started = time.time()
         result = dlp.resolve(path)
         timings.append(time.time() - started)
+        if run == 0 and result.state == dlp.STATE_DECRYPTED and result.read_path:
+            # 明文要等文件移出列表才释放；探针这里用完即还，免得"残留"数字虚高
+            dlp.release(result.read_path)
         if run == 0:
             used = getattr(provider, "last_used", None)
             print("    状态     ：%s" % result.state)
@@ -170,8 +186,12 @@ def probe(path: str, repeat: int) -> None:
         before[:16], after[:16], before == after))
 
     plain_dir = dlp.plaintext_dir()
-    left = os.listdir(plain_dir) if os.path.isdir(plain_dir) else []
-    print("  明文目录  ：%s | 残留 = %d" % (plain_dir, len(left)))
+    names = os.listdir(plain_dir) if os.path.isdir(plain_dir) else []
+    left = [n for n in names if n != dlp._PID_FILE]
+    print("  明文目录  ：%s" % plain_dir)
+    print("  残留      ：%d（%s）" % (
+        len(left), "、".join(sorted(left)) if left
+        else "无 —— 中间产物清理干净了"))
 
 
 def main(argv) -> int:
