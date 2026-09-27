@@ -323,11 +323,16 @@ class App:
         self._set_status(text, T.WARN)
 
     def _report_dlp_state(self) -> None:
-        """启动时把「解密通道」写一次状态栏（**不**弹框）。
+        """启动时把「加密文件可处理」写一次状态栏（**不**弹框）。
 
         加密文件能不能处理，完全取决于本机有没有可用的解密通道，而这件事从界面上
-        看不出来。启用时给一句确认，让用户知道"放进去的 dec.exe 已被识别"；
+        看不出来。启用时给一句确认，让部署了 dec.exe 的人知道"被识别了"；
         **没启用时保持沉默** —— 绝大多数机器没有加密软件，每次启动都提示是噪音。
+
+        状态栏只说**用户视角的结论**（能不能处理），不说通道清单 ——
+        "LDDec / cmd / PowerShell"是实现细节，对使用者是噪音（还会引来
+        "我的是几个通道""要不要选一个"这类与操作无关的问题）。
+        通道清单改写进 runtime 日志，排障时照样查得到。
         """
         try:
             provider = dlp.get_provider()
@@ -337,7 +342,10 @@ class App:
             return
         describe = getattr(provider, "describe", None)
         label = describe() if callable(describe) else getattr(provider, "name", "解密组件")
-        self._set_status(f"已启用解密通道：{label}", T.TEXT_DIM)
+        # 无条件写一行：正常运行（不开 WM_DLP_TRACE）时这是通道清单的唯一留痕，
+        # 排障时翻 runtime-<pid>.log 能回答"当时识别了哪些通道"。
+        print("[dlp] 解密通道：%s" % label, file=sys.stderr)
+        self._set_status("已就绪：可处理加密文件", T.TEXT_DIM)
 
     def _set_status(self, text: str, color: str = T.TEXT_DIM) -> None:
         """写状态栏；控件已随 root 销毁（关窗竞态）时忽略。"""
