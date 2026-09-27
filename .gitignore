@@ -3,6 +3,8 @@ dist/
 build/
 _obsolete/
 selftest_out/
+# 手动"回收站"：不再分发的旧产物先移到这里（零 rm、可还原），确认无用后再清空
+_trash/
 # audit scratch (incl. large sample PDFs) — keep _smoke/verify_exe_bytes.py? excluded for a clean repo
 _smoke/
 __pycache__/

@@ -286,7 +286,13 @@ render.render_pdf("_smoke/in.pdf", "_smoke/out.pdf", spec)
 
 ---
 
-## 十、打包与分发（两种形态，任选其一）
+## 十、打包与分发（两种形态，**对外只发单文件版**）
+
+> **当前交付形态 = 单文件版 `dist/WatermarkTool.exe`。**
+> 目录版（`dist/WatermarkTool/` + portable.zip）自 2026-09-27 起**不再产出、不再分发**，
+> 已构建的旧产物已移入 `_trash/`。打包脚本 `packaging/build.py` 与
+> `packaging/watermark-dir.spec` **保留**，需要调试时仍可自行构建，
+> 但不要把它发给用户——两个形态并存最容易出的事故是**发错包**或**丢 `_internal` 导致起不来**。
 
 两种包**功能完全一致**，都由同一份源码、同一套 `spec_common` 依赖清单构建，
 区别只在「文件怎么摆」：
@@ -307,8 +313,8 @@ render.render_pdf("_smoke/in.pdf", "_smoke/out.pdf", spec)
 构建（必须用装了 PyInstaller + 本项目依赖的**系统 Python**，托管 Python 没有 tkinter）：
 
 ```
-python packaging/build_onefile.py    # 单文件版：dist/WatermarkTool.exe
-python packaging/build.py            # 目录版：  dist/WatermarkTool/ + portable.zip
+python packaging/build_onefile.py    # 单文件版：dist/WatermarkTool.exe   ← 交付用这个
+python packaging/build.py            # 目录版：  dist/WatermarkTool/ + portable.zip（仅调试，不分发）
 ```
 
 两个脚本都会**构建 → 自检（tkdnd / 图片 / PDF / 中文路径）→ GUI 冒烟 → 出 md5**，
