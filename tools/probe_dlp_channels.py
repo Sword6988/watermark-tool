@@ -161,8 +161,9 @@ def probe(path: str, repeat: int) -> None:
         started = time.time()
         result = dlp.resolve(path)
         timings.append(time.time() - started)
-        if run == 0 and result.state == dlp.STATE_DECRYPTED and result.read_path:
-            # 明文要等文件移出列表才释放；探针这里用完即还，免得"残留"数字虚高
+        if result.state == dlp.STATE_DECRYPTED and result.read_path:
+            # 明文要等文件移出列表才释放；探针这里**每次**都用完即还，
+            # 免得"残留"数字随 --repeat 虚高，被误读成清理不干净
             dlp.release(result.read_path)
         if run == 0:
             used = getattr(provider, "last_used", None)
