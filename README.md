@@ -256,16 +256,23 @@ cd watermark-tool
 
 ---
 
-## 九、端到端复现（生成 `_smoke/` 里的样例）
+## 九、端到端复现
 
-`_smoke/` 目录已留有验证产物。复现方式：
+`_smoke/` 是**本机临时验证目录**，已被 `.gitignore` 排除 —— 它里面的样例产物不进版本库，
+所以 clone 下来是空的，需要产物就照下面这段代码现造（它会自动建目录）：
+
+> 注：`_smoke/` 里的二进制产物（压力测试 PDF、截图、旧 exe）已于 2026-09-27 清理，
+> 只留下调试脚本与日志。需要复现时按本节代码重新生成即可。
 
 ```python
 # 在 watermark-tool/ 目录下运行
+import os
 import pymupdf as fitz   # 注意：``import fitz`` 自 PyMuPDF 1.28 起已弃用（将来会 ImportError）
 from PIL import Image
 from wm import media, render
 from wm.spec import WatermarkSpec
+
+os.makedirs("_smoke", exist_ok=True)   # 该目录不进版本库，clone 后需自建
 
 spec = WatermarkSpec(text="机密文件", font_pct=4.0, margin_pct=3.0,
                      angle=30.0, opacity=0.30, color="#d32f2f").normalized()
@@ -321,9 +328,11 @@ python packaging/build.py            # 目录版：  dist/WatermarkTool/ + porta
 任何一步失败即拒绝交付。单文件版另有独立验收：
 
 ```
-python _smoke/verify_onefile.py                              # 单文件版
-python _smoke/verify_onefile.py dist/WatermarkTool/WatermarkTool.exe   # 目录版对照
+python tools/verify_onefile.py
 ```
+
+（早先这里还有一条"目录版对照"的命令行，随目录版不再分发而移除；目录版脚本仍可
+自行构建供调试，需要对比冷启动时把它的 exe 路径作为参数传给本脚本即可。）
 
 它把 exe **单独拷进空目录**运行，断言：自检全过、冷启动秒数被量化、
 `%TEMP%\_MEI*` 自解压目录确实生成（目录版则断言**不**生成）、程序目录无旁挂文件。

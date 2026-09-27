@@ -7,6 +7,8 @@ selftest_out/
 _trash/
 # audit scratch (incl. large sample PDFs) — keep _smoke/verify_exe_bytes.py? excluded for a clean repo
 _smoke/
+# tools/verify_onefile.py 的运行目录：会复制一份 32MB exe 进去并产出自检报告
+tools/_one_alone/
 __pycache__/
 *.pyc
 *.pyo
