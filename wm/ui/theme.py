@@ -160,6 +160,7 @@ UI_FAMILY = fonts.default_family()
 # ---------------------------------------------------------------------------
 
 def _hex2rgb(color: str) -> tuple:
+    """``#RRGGBB`` -> ``(r, g, b)``；不做校验（调用方保证格式，错就让它炸）。"""
     color = color.lstrip("#")
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
 
@@ -477,6 +478,7 @@ class FlatScale(tk.Canvas):
         ring_w = px(self.RING)
 
         def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            """画滑轨与滑块；``s`` 把逻辑尺寸换算成当前 DPI 下的像素数。"""
             # 未填充轨道（整条，带描边以便在白底上可辨）
             d.rounded_rectangle([s(pad), s(cy - th / 2.0), s(right), s(cy + th / 2.0)],
                                 radius=s(th / 2.0), fill=track_c,
@@ -504,6 +506,7 @@ class FlatScale(tk.Canvas):
     # -- 公共 API（与 ttk.Scale 保持兼容的最小集） ------------------------
 
     def get(self) -> float:
+        """当前数值（浮点，已按取值范围夹紧）。"""
         return self._value
 
     def set(self, value: float) -> None:
@@ -512,6 +515,7 @@ class FlatScale(tk.Canvas):
         self._redraw()
 
     def state(self, states=None):
+        """ttk 风格的状态读写：不传参返回状态元组，传参则设置并重画。"""
         if states is None:
             return ("disabled",) if self._disabled else ()
         self._disabled = "disabled" in states
@@ -712,6 +716,7 @@ class _AngleDial(tk.Canvas):
         ring_w = px(DIAL_RING_W)
 
         def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            """画角度盘：轨道圆环、方向线与可拖动手柄。"""
             # 轨道圆环（循环量：一整圈，无端点）
             d.ellipse([s(c - r), s(c - r), s(c + r), s(c + r)],
                       outline=ring_c, width=s(ring_w))
@@ -746,6 +751,7 @@ class _AngleDial(tk.Canvas):
     # -- 公共 API（与 FlatScale 同构，便于无差别替换） ---------------------
 
     def get(self) -> float:
+        """当前角度（度，已 wrap 到取值区间内）。"""
         return self._value
 
     def set(self, value: float) -> None:
@@ -754,6 +760,7 @@ class _AngleDial(tk.Canvas):
         self._redraw()
 
     def state(self, states=None):
+        """同 :meth:`FlatScale.state`：不传参读取、传参设置并重画。"""
         if states is None:
             return ("disabled",) if self._disabled else ()
         self._disabled = "disabled" in states
@@ -817,6 +824,7 @@ class _Stepper(tk.Canvas):
         self._redraw()
 
     def set_enabled(self, enabled: bool) -> None:
+        """启用 / 禁用；禁用态不再响应点击与 hover（值本身不变）。"""
         enabled = bool(enabled)
         if enabled == self._enabled:
             return
@@ -878,6 +886,7 @@ class _Stepper(tk.Canvas):
         up_fill, dn_fill = self._fills()
 
         def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            """画步进器：hover 底色、边框与 +/- 箭头。"""
             if hit_bg:
                 d.rounded_rectangle([0, 0, s(w), s(h)], radius=s(px(3)),
                                     fill=ROW_HOVER,
@@ -1186,9 +1195,11 @@ class SliderField(tk.Frame):
     # -- 公共 API ---------------------------------------------------------
 
     def get(self) -> float:
+        """当前数值。"""
         return self._value
 
     def set(self, value: float, notify: bool = True) -> None:
+        """设值；``notify=False`` 时不触发 command（程序回填用，避免回环）。"""
         # **入口处**就挡住，而不是只在 _emit 里挡「通知」。
         # 早先禁用态下滚轮 / 方向键 / 手输仍会改掉 ``_value`` 与界面文本，只有回调
         # 被吞掉 —— 结果「框里显示 37、渲染用的是 12」，解冻后一碰参数就跳变。
@@ -1272,6 +1283,7 @@ class FluentButton(tk.Canvas):
         cw, ch = self._cw, self._ch
 
         def paint(d: ImageDraw.ImageDraw, s: Callable[[float], int]) -> None:
+            """画按钮底板（圆角矩形 + 描边），配色随 kind / hover / press 变化。"""
             d.rounded_rectangle([s(px(0.5)), s(px(0.5)),
                                  s(cw - px(0.5)), s(ch - px(0.5))],
                                 radius=s(px(6)), fill=fill,
@@ -1304,11 +1316,13 @@ class FluentButton(tk.Canvas):
             self._command()
 
     def set_enabled(self, enabled: bool) -> None:
+        """启用 / 禁用；同时切换光标与配色，禁用态不响应点击。"""
         self._enabled = bool(enabled)
         self.configure(cursor="hand2" if enabled else "arrow")
         self._redraw()
 
     def set_text(self, text: str) -> None:
+        """改按钮文字并重画。"""
         self._text = text
         self._redraw()
 
@@ -1393,9 +1407,11 @@ class ColorField(tk.Frame):
                                       outline=ACCENT, width=px(2), tags="sel")
 
     def get(self) -> str:
+        """当前颜色（``#RRGGBB``，已归一化）。"""
         return self._value
 
     def set(self, color: str, notify: bool = False) -> None:
+        """设色并归一化；默认**不**回调 command（回填不应触发参数变更）。"""
         from ..spec import normalize_color
         self._value = normalize_color(color)
         self._redraw()
@@ -1445,9 +1461,11 @@ class TextArea(tk.Frame):
             self._command(self.get())
 
     def get(self) -> str:
+        """取全文；``end-1c`` 去掉 tk.Text 自动补的末尾换行。"""
         return self.text.get("1.0", "end-1c")
 
     def set(self, value: str, notify: bool = False) -> None:
+        """写入文本；禁用态下临时放开 tk.Text 再恢复（否则写不进去）。"""
         # 禁用态下 tk.Text 拒绝写入：写之前临时放开，写完恢复禁用 —— 否则
         # 「恢复默认 / 载入配置」在冻结期间会直接抛 TclError。
         was_disabled = not self._enabled

@@ -148,6 +148,7 @@ def _cancel_guard(is_cancelled: Optional[CancelFn]) -> Callable[[], None]:
         return lambda: None
 
     def check() -> None:
+        """检查一次取消标志；已取消则抛 :class:`Cancelled` 终止当前渲染。"""
         if is_cancelled():
             raise Cancelled()
 

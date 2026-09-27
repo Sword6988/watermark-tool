@@ -255,6 +255,10 @@ class App:
         app = self
 
         def _destroy_and_release() -> None:
+            """替身 ``destroy``：先释放资源（临时明文等），再调原实现销毁窗口。
+
+            清理异常一律吞掉并打印告警 —— 窗口关不掉比资源晚释放严重得多。
+            """
             try:
                 app._release_resources()
             except Exception as exc:  # 清理失败绝不能挡住销毁（窗口关不掉更严重）
@@ -706,6 +710,11 @@ class App:
         self._schedule_preview(PREVIEW_DEBOUNCE_RESIZE_MS)
 
     def _schedule_preview(self, delay: Optional[int] = None) -> None:
+        """排一次预览（默认防抖 150ms；``delay`` 可覆盖，如缩放用更短值跟手）。
+
+        新请求会**取消**上一个待执行的定时器，所以连续拖滑杆只会真正渲染一次。
+        关窗中或批处理期间直接返回。
+        """
         if self._closing:
             return
         if self._busy:
@@ -734,6 +743,12 @@ class App:
     # ------------------------------------------------------------------
 
     def _render_preview_async(self) -> None:
+        """在主线程决定"要不要起预览线程"，起则交给 :meth:`_preview_worker`。
+
+        同时只允许**一个**预览线程在跑（``_preview_busy``）：每个线程都会另起
+        一份全分辨率图像，并发叠加的内存是线性增长的。期间来的新请求只记
+        ``pending``，由 :meth:`_poll_results` 在本帧结束后用最新参数补跑。
+        """
         self._preview_job = None
         if self._closing:
             return
@@ -778,6 +793,12 @@ class App:
 
     def _preview_worker(self, gen: int, path: str, page: int, spec: WatermarkSpec,
                         canvas_w: int, canvas_h: int) -> None:
+        """**后台线程**：渲染一帧预览，结果经 :attr:`_queue` 送回主线程。
+
+        读的是 ``doc.read_path``（解密后的明文临时文件），不是原路径。
+        三条出口都要走到 ``finally`` 放开 ``_preview_busy`` 闸门，否则后续预览
+        会被永久卡在 pending。
+        """
         try:
             # 明文被删 / 被换时 render_preview 会把**具体**原因交给 problems，
             # 这里统一在「out 为 None」这一个出口上报 —— 否则同一帧会推两条消息。
@@ -811,6 +832,7 @@ class App:
     # ------------------------------------------------------------------
 
     def _choose_out_dir(self) -> None:
+        """弹目录选择框；用户取消时保持原设置不变。"""
         directory = filedialog.askdirectory(title="选择输出目录")
         if directory:
             self.out_dir = directory
@@ -824,6 +846,7 @@ class App:
         return path[:3] + "…" + path[-(max_len - 4):]
 
     def _reset_out_dir(self) -> None:
+        """回到默认：输出到与原文件同目录。"""
         self.out_dir = None
         self.out_label.configure(text="输出：与原文件同目录")
 
@@ -832,6 +855,11 @@ class App:
     # ------------------------------------------------------------------
 
     def _start_batch(self) -> None:
+        """启动批处理线程；先作废在飞的预览，避免两份全分辨率图像并存。
+
+        已在跑的批处理不会重复启动。取消标志在这里复位，否则上一轮的取消会
+        让新一轮立刻停住。
+        """
         if not self.files:
             messagebox.showinfo(TITLE, "请先添加要处理的文件。")
             return
@@ -856,10 +884,16 @@ class App:
         self._batch_thread.start()
 
     def _cancel_batch(self) -> None:
+        """请求取消：只置标志，由批处理线程在文件之间自行停下（不强杀线程）。"""
         self._cancel = True
         self.status.configure(text="正在取消…")
 
     def _set_busy(self, busy: bool) -> None:
+        """切换整组控件的可用态：批处理期间冻结参数面板、文件区与翻页。
+
+        冻结翻页不是洁癖：批处理期翻页只改导航显示、预览又被 busy 闸门挡住，
+        结果会停在"写着第 5 页、画面还是第 2 页"的错位状态。
+        """
         self._busy = bool(busy)
         # **参数面板整块冻结**（不只是按钮）：批处理期间拖一次滑杆就会起一个
         # 预览线程，它会另起一份全分辨率图像（8000×8000 单帧 +777MB）并与批处理
@@ -884,19 +918,28 @@ class App:
 
     def _batch_worker(self, files: List[str], spec: WatermarkSpec,
                       out_dir: Optional[str]) -> None:
+        """**后台线程**：把 App 的取消标志与结果队列接到 :func:`batch.run_batch`。
+
+        循环体本身在 ``batch`` 模块里（纯逻辑、可无头单测），这里只做适配。
+        ``run_batch`` 内部有 ``finally`` 保证回调 ``done``；此处的 try 挡的是
+        **回调自身抛错**导致界面永久停在"处理中"的情况。
+        """
         total = len(files)
 
         def _on_progress(done: int, count: int, label: str, index: int) -> None:
+            """进度回调（子线程）：换算成百分比后投递给主线程渲染。"""
             value = (index + done / max(1, count)) / total * 100.0
             text = f"{index + 1}/{total} 个文件" + (f" · {label}" if label else "")
             self._queue.put({"kind": "progress", "value": value, "text": text})
 
         def _on_log(text: str) -> None:
+            """日志回调（子线程）：投递给主线程统一打印。"""
             self._queue.put({"kind": "log", "text": text})
 
         sent = False
 
         def _on_done(succeeded: int, failed, cancelled: bool) -> None:
+            """结束回调（子线程）：投递 done；``sent`` 在 put 之后置位。"""
             nonlocal sent
             self._queue.put({"kind": "done", "succeeded": succeeded,
                              "failed": failed, "cancelled": cancelled})
@@ -953,6 +996,11 @@ class App:
     # ------------------------------------------------------------------
 
     def _poll_results(self) -> None:
+        """**主线程**每 50ms 抽干结果队列并续接自己，形成轮询链。
+
+        单个结果处理失败只告警、不中断：``after`` 续接写在循环外，异常一旦穿出
+        就再也排不上 —— 进度条冻结、``_busy`` 永远为真，用户只能杀进程。
+        """
         self._poll_job = None
         try:
             while True:
@@ -989,6 +1037,11 @@ class App:
                           file=sys.stderr)
 
     def _handle_result(self, item: dict) -> None:
+        """按 ``kind`` 分发队列消息（preview / progress / log / done）。
+
+        预览分支先过三道闸：关窗中、已取消、代号过期 —— 过期帧一律丢弃，
+        否则快速拖滑杆会看到画面来回跳。
+        """
         kind = item.get("kind")
         if kind == "preview":
             if self._closing:

@@ -53,6 +53,7 @@ def render_preview(
     cancelled = False
 
     def _check() -> bool:
+        """问一次"是否该停"；答案一旦为是就**锁存**，不再回头问（避免竞态）。"""
         nonlocal cancelled
         if is_cancelled is not None and is_cancelled():
             cancelled = True

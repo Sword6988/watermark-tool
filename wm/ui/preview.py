@@ -34,6 +34,7 @@ class PreviewCanvas(tk.Frame):
         on_canvas_resize: Optional[Callable[[], None]] = None,
         on_pick_files: Optional[Callable[[], None]] = None,
     ) -> None:
+        """``on_page_change`` 收 delta（±1）；``on_pick_files`` 用于空态点击选文件。"""
         super().__init__(parent, bg=T.BG)
         self._on_page_change = on_page_change
         self._on_canvas_resize = on_canvas_resize
@@ -132,6 +133,7 @@ class PreviewCanvas(tk.Frame):
         self._update_nav_visibility()
 
     def _update_nav_visibility(self) -> None:
+        """只在多页时挂载分页器（单页时挂一个点不动的分页器只会误导）。"""
         # 只在多页时显示分页器，避免首屏挂一个无意义的分页器
         if self._page_total > 1:
             if not self._nav.winfo_ismapped():
@@ -142,6 +144,7 @@ class PreviewCanvas(tk.Frame):
                 self._nav.pack_forget()
 
     def _page_step(self, delta: int) -> None:
+        """把翻页意图交给外部回调（真正的越界判断在 App 侧，那里才知道页数）。"""
         if self._on_page_change is not None:
             self._on_page_change(delta)
 
@@ -150,6 +153,10 @@ class PreviewCanvas(tk.Frame):
     # ------------------------------------------------------------------
 
     def _redraw(self) -> None:
+        """全量重画画布：有图则居中贴图，无图则按占位类型画提示。
+
+        刻意不做增量：画布内容很简单，而增量更新在缩放/切页时极易留下残影。
+        """
         self.canvas.delete("all")
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
@@ -193,6 +200,7 @@ class PreviewCanvas(tk.Frame):
     # loading 省略号动画 ----------------------------------------------------
 
     def _schedule_load_anim(self) -> None:
+        """排下一帧 loading 动画（每 400ms 一个点）；已有定时器先取消，避免叠加。"""
         if self._load_job is not None:
             try:
                 self.after_cancel(self._load_job)
@@ -201,6 +209,10 @@ class PreviewCanvas(tk.Frame):
         self._load_job = self.after(400, self._tick_loading)
 
     def _tick_loading(self) -> None:
+        """推进省略号并重画；只要仍是 loading 占位就续接下一帧。
+
+        动画存在的理由：画面静止太久会被当成卡死 —— 大图预览确实可能要好几秒。
+        """
         self._load_job = None
         self._dots = (self._dots + 1) % 4
         self._redraw()
@@ -209,6 +221,7 @@ class PreviewCanvas(tk.Frame):
             self._schedule_load_anim()
 
     def _cancel_load_anim(self) -> None:
+        """停掉动画定时器；``after_cancel`` 在窗口已销毁时会抛，故吞异常。"""
         if self._load_job is not None:
             try:
                 self.after_cancel(self._load_job)
@@ -217,6 +230,7 @@ class PreviewCanvas(tk.Frame):
             self._load_job = None
 
     def _on_configure(self, _event=None) -> None:
+        """画布尺寸变化：重画并通知外部重排预览（拖窗口边缘会连续触发）。"""
         self._redraw()
         if self._on_canvas_resize is not None:
             self._on_canvas_resize()
@@ -235,6 +249,7 @@ class PreviewCanvas(tk.Frame):
                 pass
 
     def _on_hover(self, _event=None) -> None:
+        """空态给手型光标，暗示"这里可以点"；有图则恢复默认（不做拖拽定位）。"""
         # 空态占位可点击选文件，给一个手型光标提示（预览本身不接受拖拽定位）
         if self._pil is None:
             if self._placeholder[0] == "empty" and self._on_pick_files is not None:
@@ -243,6 +258,7 @@ class PreviewCanvas(tk.Frame):
         self._set_cursor("")
 
     def _on_press(self, _event=None) -> None:
+        """空态下点击画布任意位置等价于「选择文件」（降低首次使用的门槛）。"""
         # 空态：点击画布任意位置等价于「选择文件」
         if self._pil is None and self._placeholder[0] == "empty" \
                 and self._on_pick_files is not None:

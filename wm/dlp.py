@@ -500,20 +500,29 @@ class CommandProvider(DecryptProvider):
     name = "command"
 
     def __init__(self, template: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """预解析命令模板；``timeout`` 为 None / 0 / 负值时退回默认超时。"""
         self.template = template
         self.timeout = float(timeout) if timeout and timeout > 0 else DEFAULT_TIMEOUT
         self._argv = _split_command(template)
 
     def available(self) -> bool:
+        """模板能解析出命令行即算可用 —— 不验证解密器是否真的存在。"""
         return bool(self._argv)
 
     def problem(self) -> str:
+        """不可用时说明原因；可用时返回空串（供 ``problem()`` 契约约定）。"""
         if self._argv:
             return ""
         return ("WM_DLP_DECRYPT_CMD 无法解析成命令行（%s）—— 多半是引号未闭合"
                 % (self.template or "空"))
 
     def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        """调用外部解密器产出 ``dst``；中途任何一步失败都抛 :class:`DecryptError`。
+
+        ``deadline`` 是**整批处理**的绝对截止时刻（``time.monotonic`` 基准，由
+        :func:`decrypt` 传入）：它只用来把本次调用的超时压缩到剩余预算内，
+        不会中止已经启动的子进程。
+        """
         if not self._argv:
             raise DecryptError(self.problem())
         ext = os.path.splitext(src)[1]
@@ -596,9 +605,11 @@ class TransparentReadProvider(DecryptProvider):
     label = "系统读取"
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """只记超时；可用性判定交给子类（各自依赖的受信任进程不同）。"""
         self.timeout = float(timeout) if timeout and timeout > 0 else DEFAULT_TIMEOUT
 
     def available(self) -> bool:
+        """由子类实现：不同受信任进程（cmd / PowerShell）的可得性判定不同。"""
         raise NotImplementedError
 
     def _read_plaintext(self, work: str, dst: str) -> None:
@@ -606,6 +617,11 @@ class TransparentReadProvider(DecryptProvider):
         raise NotImplementedError
 
     def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        """复制副本 → 借受信任进程读出明文 → 校验非空 → 清理副本。
+
+        ``deadline`` 语义同 :meth:`CommandProvider.decrypt`：仅压缩单次超时。
+        子类只需实现 :meth:`_read_plaintext`，复制与清理的骨架在这里统一。
+        """
         if not self.available():
             raise DecryptError(f"{self.label}通道在当前系统不可用")
         if not os.path.isfile(src):
@@ -643,12 +659,19 @@ class CmdTypeProvider(TransparentReadProvider):
     label = "cmd 读取"
 
     def __init__(self, timeout: float = CMDTYPE_TIMEOUT) -> None:
+        """``timeout`` 默认比通用值小：``type`` 读一个文件通常不到一秒。"""
         super().__init__(timeout)
 
     def available(self) -> bool:
+        """仅 Windows 且能定位到 cmd.exe 时可用。"""
         return os.name == "nt" and bool(_cmd_executable())
 
     def _read_plaintext(self, work: str, dst: str, timeout: Optional[float] = None) -> None:
+        """依次用三种调用形式读 ``work`` 到 ``dst``，任意一种成功即返回。
+
+        重试的原因：不同形式对引号与空格的处理不一致，而失败常表现为「返回 0
+        但没有产物」—— 多试一次的成本远低于让用户排查一次。
+        """
         cmd = _cmd_executable()
         timeout = timeout if timeout and timeout > 0 else self.timeout
         attempts = (
@@ -688,12 +711,19 @@ class PowershellProvider(TransparentReadProvider):
     label = "PowerShell 读取"
 
     def __init__(self, timeout: float = POWERSHELL_TIMEOUT) -> None:
+        """超时给得比 cmd 宽：PowerShell 冷启动本身就要一两秒。"""
         super().__init__(timeout)
 
     def available(self) -> bool:
+        """仅 Windows 且能定位到 powershell.exe 时可用（精简版系统可能不带）。"""
         return os.name == "nt" and bool(_powershell_executable())
 
     def _read_plaintext(self, work: str, dst: str, timeout: Optional[float] = None) -> None:
+        """用 ``ReadAllBytes`` / ``WriteAllBytes`` 整块搬运字节。
+
+        走单引号字符串传路径：中文、空格、方括号、``$`` 在单引号里都是字面量，
+        只需把单引号本身翻倍 —— 这也是本通道不受非 ASCII 路径影响的原因。
+        """
         timeout = timeout if timeout and timeout > 0 else self.timeout
         # 路径进单引号字符串：只需把单引号本身翻倍；其余字符（含中文、空格、
         # 方括号、$）在单引号里都是字面量，无需再转义。
@@ -737,23 +767,35 @@ class ChainProvider(DecryptProvider):
     name = "chain"
 
     def __init__(self, providers: List[DecryptProvider]) -> None:
+        """按**优先级**接收通道列表（靠前的先试）；``None`` 会被丢弃。"""
         self.providers = [p for p in providers if p is not None]
         self.last_used: Optional[DecryptProvider] = None
 
     def available(self) -> bool:
+        """任一通道可用即算可用（不要求全部可用）。"""
         return any(p.available() for p in self.providers)
 
     def problem(self) -> str:
+        """全部不可用时，把各通道的原因拼成一条中文说明。"""
         if self.available():
             return ""
         reasons = [p.problem() for p in self.providers if not p.available()]
         return "；".join(r for r in reasons if r) or "所有解密通道在当前系统均不可用"
 
     def describe(self) -> str:
+        """给用户看的当前可用通道列表（如 ``LDDec（dec.exe）、cmd 读取``）。"""
         ready = [p for p in self.providers if p.available()]
         return "、".join(_channel_label(p) for p in ready) or "无可用通道"
 
     def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        """按序试各通道，**任一通道产出可用明文即返回**并记入 :attr:`last_used`。
+
+        判定标准是 :func:`verify_plaintext`（内容真是明文），不是"进程返回 0"：
+        返回 0 却读到密文的情况在透明加密环境里非常常见。
+
+        ``deadline`` 耗尽后不再尝试后续通道 —— 一条通道已失败、预算又没了，
+        继续试只会拖长批处理的总耗时。
+        """
         if not self.providers:
             raise DecryptError("没有配置任何解密通道")
         notes: List[str] = []
@@ -931,16 +973,30 @@ class LddecProvider(DecryptProvider):
     name = "lddec"
 
     def __init__(self, exe: str, timeout: float = LDDEC_TIMEOUT) -> None:
+        """``exe`` 为 dec.exe 的绝对路径（由 :func:`find_lddec` 定位后传入）。"""
         self.exe = str(exe)
         self.timeout = float(timeout) if timeout and timeout > 0 else LDDEC_TIMEOUT
 
     def available(self) -> bool:
+        """dec.exe 确实存在于磁盘即算可用。
+
+        刻意**不**要求同目录有 ``config.json``：那只是 TCP 版需要，cmd 版
+        （WinDec）根本不读它，据此拒绝会误伤只放了 dec.exe 的机器。
+        """
         return bool(self.exe) and os.path.isfile(self.exe)
 
     def describe(self) -> str:
+        """带上 exe 文件名，便于排障时确认用的是哪一个 dec.exe。"""
         return "LDDec（%s）" % os.path.basename(self.exe)
 
     def decrypt(self, src: str, dst: str, deadline: Optional[float] = None) -> None:
+        """把**副本**交给 dec.exe 就地解密，再把产物搬到 ``dst``。
+
+        调用全程持 :data:`_call_lock`：LDDec 用固定端口（34500）与固定临时
+        产物名，并发调用必然互相踩（表现为"返回 0 但没产物"）。
+
+        ``cwd`` 设为 exe 所在目录 —— TCP 版要在同目录找 ``config.json``。
+        """
         if not self.available():
             raise DecryptError(f"未找到 LDDec 可执行文件：{self.exe}")
         exe_dir = os.path.dirname(self.exe)

@@ -122,6 +122,11 @@ class Document:
     """
 
     def __init__(self, path: str, read_path: Optional[str] = None) -> None:
+        """只做**打开 + 读头部元数据**，不解码像素（大图靠惰性打开才不爆内存）。
+
+        ``read_path`` 是实际读取路径（加密文件解密后指向临时明文）；输出命名
+        仍用 ``path``。带口令的 PDF 在这里就抛 :class:`PasswordRequiredError`。
+        """
         self.path = str(path)
         #: 实际读取路径。加密文件解密后指向临时明文；默认与 ``path`` 相同。
         #: **输出命名一律用 ``path``**（原文件旁出图），只有"读"走 ``read_path``。
