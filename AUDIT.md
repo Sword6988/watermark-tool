@@ -405,6 +405,10 @@ opacity / color）**全部完备**，连续渲染不串水印。
   `tests/test_all.py` 放宽两处墙钟断言（3.0→8.0s、1.0→5.0s）消除 flaky。
 - 低优先 P2 建议（`time.sleep` 让出频率、注解/docstring 覆盖率、cache key 收敛到单函数、`from_dict` 加版本号）
   本次未做，仍列于「P2 改进建议」节，属锦上添花，不影响交付。
+  > **2026-09-27 结账**：其中两项已做（提交 `ec72277` / `eb82283`）——
+  > docstring 补到 wm/ 包 335/386 = 86.8%（面向"为什么"，不凑数）；
+  > `from_dict` 加 `SCHEMA_VERSION`（读过新版本数据不再静默）。
+  > `time.sleep` 让出频率与 cache key 收敛仍未做。
 
 ### ✅ 交付后追加：数字框悬停步进器（方案 C）
 
@@ -590,8 +594,11 @@ tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
 - **`app.py` 拆分**（见 P1-4）、跨模块私有调用 `render.py:113` 直接调 `layout._render_block_bitmap`
 - `time.sleep(0.001)` 实测 1.58ms/次，200 页多花 0.32s（约 10%），可改成每 16 页让出一次
 - **测试基建**：无超时；**SKIP 不计入退出码**（实测屏蔽 tkinterdnd2 → 退出码 0、7 条零断言用例照样"通过"）；42% 的 assert 无失败消息；5 处硬编码秒数断言会 flaky；`__pycache__` 混了 313/314 两套
-- 注解覆盖率 79%、docstring 覆盖率 45.5%
+- 注解覆盖率 79%、docstring 覆盖率 45.5% → **2026-09-27：`wm/` 包补到 335/386 = 86.8%**
+  （补的是隐式契约：dlp 的 deadline/串行锁/副本释放、app 的预览与批处理并发语义；
+  theme 的 `_on_press` 一类名字即文档的 Tk 回调**刻意不补**，避免为覆盖率堆重复文字）
 - `WatermarkSpec.from_dict` 无版本号：未知字段静默丢弃、缺失字段静默取默认
+  → **2026-09-27 已处理**（`SCHEMA_VERSION`）；行为不变，只是给"读了更新的数据"留下痕迹
 - 新增参数时需同步**两个** cache key（`layout.py:111-118` / `:148-154`），漏改 = 静默渲染错 —— 建议把 key 生成收敛到一个函数
 
 ---
