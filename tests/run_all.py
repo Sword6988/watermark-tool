@@ -21,23 +21,20 @@
 
 from __future__ import annotations
 
-import gc
 import importlib.util
 import os
 import subprocess
 import sys
-import threading
 import traceback
-import unittest
 from typing import Callable, List, Tuple
 
-#: 单个用例超时（秒）。Windows 下不能用 signal 定时器（非主线程不安全），
-#: 故用 worker 线程 + join(timeout) 实现看门狗；超时即记为失败，不阻塞后续。
+#: 单个用例超时（秒）。用例跑在**子进程**里，超时由 ``subprocess`` 直接终止进程，
+#: 不会留下半死的线程继续改全局状态。
 TEST_TIMEOUT = 30.0
 
-#: 超时后再给的宽限（秒）。超时的用例线程仍活着时，它的 ``finally`` 还没跑；
-#: 多等一会儿让它自己收尾（恢复它改过的模块常量），比我们硬恢复更干净。
-GRACE_AFTER_TIMEOUT = 5.0
+#: 子进程的跳过标记：``_case_runner.py`` 把 SkipTest 的原因写到 stderr 的这一行，
+#: 主运行器据此区分「跳过」与「失败」（两者退出码不同，但原因要走 stderr 传回）。
+SKIP_MARK = "__SKIP__:"
 
 #: 用例之间必须复原的模块级常量（**看门狗超时会让用例的 finally 永远不执行**，
 #: 这些全局就会被永久改写，污染后面所有用例 —— 实测过：test_banding 超时把
@@ -144,31 +141,57 @@ def _baseline_globals() -> dict:
     return _snapshot_globals()
 
 
-def _rerun_isolated(path: str, name: str) -> bool:
-    """在**独立子进程**里复跑一条用例（主线程、干净解释器）；通过返回 True。
+def _run_case(path: str, name: str) -> Tuple[str, str]:
+    """在**独立子进程**里跑一条用例，返回 ``(状态, 详情)``。
 
-    只用于"子线程里失败了"的兜底判定：真失败会两次都失败，偶发抖动则在干净的
-    解释器里通过。子进程自带超时，不会把运行器自己挂住。
+    状态取值：``ok`` / ``skip`` / ``fail`` / ``timeout``。
+
+    这是本运行器的**默认执行方式**（早期是在子线程里跑、失败后再用子进程复跑
+    一次兜底）。彻底隔离后带来三个好处：
+
+    1. Tk 的创建与销毁都在子进程的**主线程**，进程一退 Tcl 随之释放 ——
+       不再有「销毁 root 后遗留对象被别的线程 GC，``__del__`` 跨线程调用 Tcl
+       导致永久阻塞」这条路径，也就不再需要 ``gc.disable()`` 去规避它；
+    2. 超时能**真正杀掉**进程（以前只能放弃等待，线程仍在后台跑，它改过的
+       模块常量会污染后续用例）；
+    3. 用例之间的模块级状态天然隔离，用例内怎么 monkeypatch 都互不影响。
+
+    代价是每条用例多一次解释器启动（约 1~2 秒），以及超时时拿不到卡住的调用栈
+    （进程已被终止）—— 前者可接受，后者由「干净解释器里仍超时」这一事实本身
+    提供足够信息。
+
+    stdout 继承父进程（用例打印照常显示），stderr 捕获（Tk 那类噪音只在失败时
+    才翻出来），跳过原因通过 stderr 里的 ``SKIP_MARK`` 行传回。
     """
-    code = (
-        "import importlib.util, os, sys, unittest;"
-        "sys.path.insert(0, %r);"
-        "spec = importlib.util.spec_from_file_location('case', %r);"
-        "m = importlib.util.module_from_spec(spec); sys.modules['case'] = m;"
-        "spec.loader.exec_module(m);"
-        "fn = getattr(m, %r);"
-        "sys.exit(0 if fn() is None else 0)"
-        % (ROOT, path, name)
-    )
+    runner = os.path.join(HERE, "_case_runner.py")
     try:
-        completed = subprocess.run([sys.executable, "-c", code],
-                                   timeout=TEST_TIMEOUT,
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
-        return completed.returncode == 0
-    except Exception:
-        # 复跑本身出问题（起不来进程 / 超时）：按原失败处理，不吞掉真问题
-        return False
+        proc = subprocess.run(
+            [sys.executable, runner, path, name],
+            timeout=TEST_TIMEOUT,
+            stdout=None,              # 继承：用例自身的打印照常显示
+            stderr=subprocess.PIPE,   # 捕获：噪音与 traceback 按需展示
+            cwd=os.getcwd(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = "测试运行超过 %d 秒（超时，子进程已终止）" % int(TEST_TIMEOUT)
+        tail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        if tail:
+            detail += "\n" + tail[-2000:]
+        return ("timeout", detail)
+    except Exception as exc:  # 起不来进程等：按失败处理，绝不静默
+        return ("fail", "无法启动用例子进程：%r" % (exc,))
+
+    err = (proc.stderr or b"").decode("utf-8", "replace")
+    if proc.returncode == 0:
+        return ("ok", "")
+    if proc.returncode == 2:
+        reason = "（未给出原因）"
+        for line in err.splitlines():
+            if line.startswith(SKIP_MARK):
+                reason = line[len(SKIP_MARK):] or reason
+                break
+        return ("skip", reason)
+    return ("fail", err.strip() or "子进程以退出码 %d 结束（无输出）" % proc.returncode)
 
 
 def main() -> int:
@@ -178,19 +201,16 @@ def main() -> int:
         print("[FAIL] 未发现任何 test_*.py")
         return 1
 
-    # 关掉自动 GC：它是「用例莫名超时 30s」的直接触发者。
+    # 注意：这里**不再**调用 ``gc.disable()``。
     #
-    # 机理（实测，详见 AUDIT.md）：本运行器把每个用例放在**子线程**里跑，而 Tk
-    # 解释器绑定在**创建它的线程**上。前序 GUI 用例销毁 root 后，``tkinter.font.Font``
-    # 之类会变成只可被 GC 回收的循环垃圾；一旦 GC 在某个**别的**用例线程里跑起来，
-    # 其 ``__del__`` 就会跨线程调用 Tcl（``font delete``）→ Tcl 永久阻塞 →
-    # 该用例被看门狗判为超时。表现是"单独跑 0.01s，完整回归里必挂"，且挂哪一条
-    # 会随导入时机漂移（修好 A 就挪到 B）。
+    # 以前必须关掉自动 GC（详见 AUDIT.md）：用例跑在子线程里，而 Tk 解释器绑定在
+    # 创建它的线程上，前序 GUI 用例销毁 root 后遗留的 ``tkinter.font.Font`` 一旦
+    # 被 GC 回收，其 ``__del__`` 会跨线程调用 Tcl → Tcl 永久阻塞 → 看门狗判超时，
+    # 表现为"单独跑 0.01s，完整回归里必挂"。关掉自动 GC 只是**规避**那条路径。
     #
-    # 关掉自动 GC 后，这类对象在本轮内不再被回收（引用计数能清的照清，测试里的
-    # 大对象基本都是引用计数回收的），跨线程 ``__del__`` 这条路径就不存在了。
-    # 注意这仍属**规避**：彻底方案是让每个用例跑在独立子进程里。
-    gc.disable()
+    # 现在每条用例都在独立子进程的主线程里跑（:func:`_run_case`），Tk 的创建与
+    # 销毁同线程、进程退出即释放，跨线程 ``__del__`` 不复存在 —— 规避手段可以撤掉，
+    # 让 GC 回归默认行为，反而更接近真实运行环境。
     baseline = _baseline_globals()
     passed = 0
     skipped: List[Tuple[str, str]] = []
@@ -210,59 +230,22 @@ def main() -> int:
                 continue
             label = f"{filename}::{name}"
 
-            # 上一个用例（可能被看门狗中断、finally 未执行）留下的污染先清掉
+            # 用例一律跑在独立子进程里（子进程内部是主线程、干净解释器）。
+            # 主进程只负责调度与汇总，自己不再执行任何用例代码，因此也不再需要
+            # 复原被污染的模块常量 —— 下面的调用只是兜底（若将来回退到进程内执行）。
             _restore_globals(baseline)
-
-            # 看门狗：worker 线程跑用例、捕获异常；主线程 join 限时，超时记为失败。
-            result: dict = {}
-
-            def _run():
-                try:
-                    func()
-                    result["ok"] = True
-                except unittest.SkipTest as exc:  # 依赖缺失：零断言，必须显形
-                    result["skip"] = str(exc) or "（未给出原因）"
-                except Exception:
-                    result["fail"] = traceback.format_exc()
-
-            worker = threading.Thread(target=_run, daemon=True)
-            worker.start()
-            worker.join(timeout=TEST_TIMEOUT)
-            if worker.is_alive():
-                # 诊断：超时多为偶发，看结果根本猜不出卡在哪 —— 把卡住线程的
-                # 调用栈打出来（sys._current_frames 能拿到**别的**线程的栈）。
-                frame = sys._current_frames().get(worker.ident)
-                if frame is not None:
-                    print("  [超时诊断] 卡在：")
-                    for line in traceback.format_stack(frame)[-8:]:
-                        print("    " + line.rstrip())
-                # 仍活着 = 超时。先给个宽限让它自己跑完 finally（那样常量恢复得
-                # 最干净），再兜底复原 —— 否则污染会顺着跑到后面的用例上。
-                worker.join(timeout=GRACE_AFTER_TIMEOUT)
-                _restore_globals(baseline)
-                failures.append((label, "测试运行超过 %d 秒（超时）" % int(TEST_TIMEOUT)))
-                print(f"[FAIL] {label} (超时 30s)")
-                continue
-            _restore_globals(baseline)
-            if result.get("ok"):
+            status, detail = _run_case(path, name)
+            if status == "ok":
                 passed += 1
                 print(f"[OK]   {label}")
-            elif "skip" in result:
-                skipped.append((label, result["skip"]))
+            elif status == "skip":
+                skipped.append((label, detail))
                 print(f"[SKIP] {label}")
+            elif status == "timeout":
+                failures.append((label, detail))
+                print(f"[FAIL] {label} (超时 {int(TEST_TIMEOUT)}s)")
             else:
-                # Tk 用例在**子线程**里会偶发失败（Tcl 解释器绑定在创建它的线程，
-                # `after` 回调与 `Variable.__del__` 都可能跨线程触发），表现是
-                # "单独跑必过、完整回归里偶尔挂"。与其把它当真失败，不如**在独立
-                # 子进程里复跑一次**：同样的用例、干净的解释器、主线程。
-                #
-                # 用子进程而不是"就地再跑一次"：① 真能消除跨线程污染；
-                # ② 自带超时，不会让运行器挂在复跑上。
-                if _rerun_isolated(path, name):
-                    passed += 1
-                    print(f"[OK]   {label}  （子线程失败，隔离复跑通过 —— 偶发抖动）")
-                    continue
-                failures.append((label, result.get("fail", "（未知失败）")))
+                failures.append((label, detail))
                 print(f"[FAIL] {label}")
 
     total = passed + len(skipped) + len(failures)
