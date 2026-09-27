@@ -411,12 +411,29 @@ def _split_argv(argv: list) -> Tuple[list, Optional[str]]:
     return files, selftest_out
 
 
+def _warn_non_ascii_paths() -> None:
+    """启动期留痕：解包目录含非 ASCII 时记一行（**不阻断**）。
+
+    为什么留痕而不是直接处理：本机模拟验证过（中文 / emoji 路径）三条解密通道都
+    照常产出字节，现代 Windows 的 ``type`` 走 Unicode API，不走 ANSI。但**真
+    exe + 中文 ``%TEMP%``** 这一组合没法在没有中文账号的机器上真实复现 —— 与其
+    猜测，不如让它出问题时在日志里自己说话。
+    """
+    if not FROZEN:
+        return
+    base = getattr(sys, "_MEIPASS", "") or ""
+    if base and not base.isascii():
+        print("[WARN] 解包目录含非 ASCII 字符：%s —— 若解密异常，请把程序放到"
+              "纯 ASCII 路径下（此路径由 %%TEMP%% 决定）" % base, file=sys.stderr)
+
+
 def main(argv: list) -> int:
     try:
         # install_stdio 必须在 try 里：它依赖 user_log_dir()（要建目录），而
         # 兜底逻辑在下面的 except —— 若在 try 之外抛出，就没人接得住了。
         install_stdio()
         install_excepthooks()
+        _warn_non_ascii_paths()
         files, selftest_out = _split_argv(argv[1:])
         if selftest_out is not None:
             # 自检**不走**下面的 GUI 报错路径：那里会弹模态框，在无头环境（打包脚本 /

@@ -263,6 +263,12 @@ def plaintext_dir() -> str:
     with _state_lock:
         if _plain_dir is None or not os.path.isdir(_plain_dir):
             _plain_dir = tempfile.mkdtemp(prefix=PLAIN_DIR_PREFIX, dir=_ascii_temp_root())
+            if not _plain_dir.isascii():
+                # 已实测：现代 Windows 的 `type` 走 Unicode API，中文 / emoji 路径
+                # 都能正常读（本机模拟验证见 _smoke/probe_cn_path.py）。所以这里
+                # **不阻断**，只留痕 —— 真出问题时日志里一眼能看到，不用猜。
+                _warn("临时明文目录含非 ASCII 字符：%s（若解密异常，请把程序放在"
+                      "纯 ASCII 路径下，或确认临时目录为纯 ASCII）" % _plain_dir)
             _write_owner_pid(_plain_dir)
             if not _gc_done:
                 _gc_done = True

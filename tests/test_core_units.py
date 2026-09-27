@@ -215,3 +215,51 @@ def test_panel_scrolled_frame_cancels_wheel_job_on_destroy() -> None:
             root.destroy()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 非 ASCII 路径（模拟中文用户名机器）
+# ---------------------------------------------------------------------------
+
+def test_ascii_temp_root_returns_pure_ascii_dir() -> None:
+    """临时根必须是纯 ASCII：这是"中文用户名机器"上唯一能主动消除的隐患。"""
+    from wm import dlp
+
+    root = dlp._ascii_temp_root()
+    if root is None:
+        raise unittest.SkipTest("本机找不到任何纯 ASCII 临时目录（罕见）")
+    assert root.isascii(), root
+    assert os.path.isdir(root), root
+
+
+def test_cmdtype_reads_non_ascii_source_path_byte_exact() -> None:
+    """中文（含 emoji）**原文件**路径要能字节保真地读出来。
+
+    用户文件叫「PLM验收单.pdf」是常态；工具内部只读 ASCII 副本，所以这条测的是
+    "从中文路径复制到 ASCII 副本"这一段。
+    """
+    import tempfile
+
+    from wm import dlp
+
+    provider = dlp.CmdTypeProvider()
+    if not provider.available():
+        raise unittest.SkipTest("当前系统没有 cmd.exe")
+    with tempfile.TemporaryDirectory() as tmp:
+        cn_dir = os.path.join(tmp, "中文 目录\U0001f512")
+        os.makedirs(cn_dir, exist_ok=True)
+        src = os.path.join(cn_dir, "PLM验收单\U0001f512.pdf")
+        blob = dlp.magic() + b"%PDF-1.6\n" + os.urandom(2048)
+        with open(src, "wb") as handle:
+            handle.write(blob)
+
+        dst = dlp.new_plaintext_path(src)
+        try:
+            provider.decrypt(src, dst)
+            assert os.path.isfile(dst), "没有产出文件"
+            assert os.path.getsize(dst) == len(blob), (
+                "字节数不一致：%d != %d" % (os.path.getsize(dst), len(blob)))
+            with open(dst, "rb") as handle:
+                assert handle.read() == blob, "内容不是字节保真"
+        finally:
+            dlp.release(dst)
