@@ -60,24 +60,48 @@ def main() -> int:
         raise SystemExit("[FAIL] dist/_internal 存在，说明打成了目录版")
     print("[OK] 单文件产物: %s (%.1f MB)" % (EXE, os.path.getsize(EXE) / 1e6))
 
-    # 4b) 关键依赖**必须真的进了包**：目录版脚本有 mupdf DLL 与 tkdnd 的断言，
-    # 单文件版原本一个都没有 —— 而单文件是实际交付形态，缺了它照样能构建成功、
-    # 运行时才炸。这里做字节级抽查（与 _smoke/verify_exe_bytes.py 同源思路）。
+    # 4b) 关键依赖**必须真的进了包**：目录版脚本有 mupdf DLL / tkdnd / dec.exe 的
+    # 断言，单文件版原本一个都没有 —— 而单文件是实际交付形态，缺了它照样能构建
+    # 成功、运行时才炸。
+    #
+    # ⚠️ 两类判据必须分开，混用会造出假绿灯/假红灯：
+    #   * **exe 字节**只能搜到「压缩包里的**条目名**」（mupdf / tkdnd / dec.exe
+    #     都是数据文件名，未压缩地出现在归档目录里）—— 搜**源码里的字符串**
+    #     （如 WM_DLP_DECRYPT_CMD）搜不到：PYZ 是 zlib 压缩的，模块字节码根本
+    #     不以明文存在于 exe 中（曾因此误判「包内缺少解密适配层」）。
+    #   * 模块级别的「有没有收集」要看 **PYZ-00.toc**（文本，列出全部模块的
+    #     导入名），数据文件看 **Analysis-00.toc**。
     blob = open(EXE, "rb").read()
-    required = {
-        "mupdf DLL": b"mupdf",
-        "tkdnd 库": b"tkdnd",
-        "解密适配层": b"WM_DLP_DECRYPT_CMD",
-    }
-    dec_dir = os.path.join(ROOT, "tools", "LDDec")
-    dec_exe = os.path.join(dec_dir, "dec.exe")
-    if os.path.isfile(dec_exe):
-        required["LDDec（dec.exe）"] = b"dec.exe"
-    for label, token in required.items():
+    for label, token in (("mupdf DLL", b"mupdf"), ("tkdnd 库", b"tkdnd")):
         if token not in blob:
             raise SystemExit("[FAIL] 包内缺少 %s（搜不到 %r），拒绝交付"
                              % (label, token))
         print("  [OK] 已包含 %s" % label)
+
+    workpath = os.path.join(BUILD, "pyi-one", "watermark-onefile")
+    pyz_toc = os.path.join(workpath, "PYZ-00.toc")
+    if not os.path.isfile(pyz_toc):
+        raise SystemExit("[FAIL] 找不到 %s，无法校验模块是否入包" % pyz_toc)
+    pyz_text = open(pyz_toc, encoding="utf-8", errors="replace").read()
+    # 核心模块**逐个**点名，而不是只挑两个：任何一个漏掉都会在运行时炸，
+    # 而且漏掉的往往正是「本次改动、却忘了验证」的那个。
+    missing = [name for name in ("wm.dlp", "wm.media", "wm.render",
+                                 "wm.layout", "wm.spec", "wm.fonts", "wm.lru")
+               if "'%s'" % name not in pyz_text]
+    if missing:
+        raise SystemExit("[FAIL] 核心模块未进包：%s，拒绝交付" % "、".join(missing))
+    print("  [OK] 已收集核心模块：%s" % "、".join(
+        n for n in ("wm.dlp", "wm.media", "wm.render", "wm.layout",
+                    "wm.spec", "wm.fonts", "wm.lru")))
+
+    dec_exe = os.path.join(ROOT, "tools", "LDDec", "dec.exe")
+    if os.path.isfile(dec_exe):
+        ana_toc = os.path.join(workpath, "Analysis-00.toc")
+        ana_text = (open(ana_toc, encoding="utf-8", errors="replace").read()
+                    if os.path.isfile(ana_toc) else "")
+        if b"dec.exe" not in blob and "dec.exe" not in ana_text:
+            raise SystemExit("[FAIL] 随包的 dec.exe 未进包，拒绝交付")
+        print("  [OK] 已包含 LDDec（dec.exe）")
 
     # 5) 自检验收（同目录版：退出码 + 报告无 [FAIL] 双重判定）
     accept_dir = os.path.join(BUILD, "_accept_one")
