@@ -297,9 +297,14 @@ render.render_pdf("_smoke/in.pdf", "_smoke/out.pdf", spec)
 
 > **当前交付形态 = 单文件版 `dist/WatermarkTool.exe`。**
 > 目录版（`dist/WatermarkTool/` + portable.zip）自 2026-09-27 起**不再产出、不再分发**，
-> 已构建的旧产物已移入 `_trash/`。打包脚本 `packaging/build.py` 与
+> 已构建的旧产物已清理。打包脚本 `packaging/build.py` 与
 > `packaging/watermark-dir.spec` **保留**，需要调试时仍可自行构建，
 > 但不要把它发给用户——两个形态并存最容易出的事故是**发错包**或**丢 `_internal` 导致起不来**。
+>
+> ⚠️ **`packaging/build.py` 不能删**，它不只是目录版脚本：
+> `build_onefile.py:24` 是 `import build as B`，单文件版打包依赖其中的
+> `DIST` / `BUILD` / `move_aside` / `prune_obsolete` / `run` 五个符号。
+> **删掉它，单文件版就打不出来了。** 目录版可以不 build，这个模块不能没有。
 
 两种包**功能完全一致**，都由同一份源码、同一套 `spec_common` 依赖清单构建，
 区别只在「文件怎么摆」：
