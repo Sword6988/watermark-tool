@@ -60,9 +60,6 @@ def _load_dlp():
 
 
 dlp, DLP_FROM = _load_dlp()
-#: 是否按文件路径单独加载（而非以 ``wm`` 包导入）：此时 ``wm.media`` 用不了，
-#: "原路径能不能直读"这条判据不可信，输出里要显式说明。
-STANDALONE = not DLP_FROM.startswith("wm.dlp")
 
 
 def sha256(path: str) -> str:
@@ -119,10 +116,11 @@ def probe(path: str, repeat: int) -> None:
     readable = dlp.probe_readable(path)
     if readable is None:
         print("  按原路径打开：可以（读到的就是明文，说明已在白名单里）")
-    elif "文件解析模块不可用" in readable and STANDALONE:
-        # 单独拷出 dlp.py 时 media 导入不了，这条判据必然失败 —— 不是本机的真实行为
+    elif "文件解析模块不可用" in readable:
+        # 只带 dlp.py 时 wm.media 导入不了（它依赖 PyMuPDF/Pillow），这条判据
+        # 必然失败 —— 是**探针的运行方式**造成的，不是本机的真实行为。
         print("  按原路径打开：%s" % readable)
-        print("                ^ 独立加载 dlp.py 时的正常现象（缺 wm.media），"
+        print("                ^ 只带 dlp.py 时的正常现象（缺 wm.media），"
               "**不代表 exe 里的行为**：真实 exe 会真的试着打开一次")
     else:
         print("  按原路径打开：失败 —— %s" % readable)
@@ -139,8 +137,9 @@ def probe(path: str, repeat: int) -> None:
     exe = dlp.find_lddec()
     print("  dec.exe    ：%s" % (exe or "未找到（LDDec 通道不参与）"))
     if not exe:
-        print("                ^ 想单独验证 LDDec 通道：把 dec.exe 拷到本目录后，"
-              "用 set WM_LDDEC_EXE=<完整路径> 再跑一次")
+        print("                ^ 想单独验证 LDDec 通道，二选一：把 dec.exe 放进")
+        print("                  <本目录>/wm/ 的上一级（即与本脚本同级），")
+        print("                  或 set WM_LDDEC_EXE=<dec.exe 完整路径> 后重跑")
 
     channels = list(getattr(provider, "providers", [provider]))
     print("  ---- 逐通道强制单独尝试（顺序 = 回退优先级）----")
