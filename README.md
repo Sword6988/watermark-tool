@@ -419,9 +419,26 @@ LDDec 有**两套**实现，二进制都叫 `dec.exe`，命令行用法相同（
 | `WM_DLP_BUDGET` | 单个文件的解密**总预算**秒数（默认 120，覆盖各通道重试；`0` / 负数 = 不限）。总闸，防「拖 20 个加密文件卡几十分钟且关不掉」 |
 | `WM_DLP_MAX_BYTES` | 明文**总量**上限字节（默认 4 GB）：一次性拖入几百个大文件时防撑爆磁盘 |
 | `WM_DLP_MAGIC` | 加密魔数（十六进制，默认 `88 7d 1c`）；配错会在日志里留一行 `[WARN]` |
+| `WM_DLP_TRACE` | `1` / `on` / `true` / `yes` 打开**解密跟踪**：每个文件的每条通道「尝试 / 成功 / 失败」与耗时写进 `runtime-<pid>.log`。排查「到底哪条通道解的、单文件花多久」时用，默认关闭（不留任何输出） |
 
 自动搜索顺序：`WM_LDDEC_EXE` → 程序目录下 `LDDec/`、`tools/LDDec/`、程序目录本身、
 `tools/lddec/`。
+
+**想知道具体是哪条通道解的、各花多久**，两条路（都不需要装 Pillow / PyMuPDF）：
+
+```bat
+rem ① 用打包好的 exe：设一次环境变量再双击，看 runtime-<pid>.log
+set WM_DLP_TRACE=1
+水印工具.exe
+```
+
+```bat
+rem ② 用源码逐通道强制单跑（连"整条链会走哪条"也一起给出）
+<PY> tools/probe_dlp_channels.py "D:\Desktop\PLM验收单.pdf"
+```
+
+`tools/probe_dlp_channels.py` 只用标准库；拷到内网时最少带两个文件 —— 它和
+`wm/dlp.py` 放同一目录即可直接跑。
 
 **无论哪种解密器，交给它的永远是临时目录里的密文副本，不是原文件** —— 所以"就地
 覆盖"语义（LDDec 正是如此）覆盖的也只会是一份副本。

@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from PIL import Image
 
@@ -1002,3 +1002,122 @@ def test_dlp_batch_reports_plaintext_lost_instead_of_generic_open_error() -> Non
         reason = failed[0][1]
         assert "已失效" in reason or "已被移走" in reason, \
             f"失败原因应点明明文失效，实际：{reason}"
+
+
+# ---------------------------------------------------------------------------
+# 临时目录不残留（work 副本必须显式删）
+# ---------------------------------------------------------------------------
+
+def _snapshot() -> Set[str]:
+    """明文目录当前清单（明文目录是**进程级共享**的，只能比差集不能比绝对数）。"""
+    directory = dlp.plaintext_dir()
+    try:
+        return set(os.listdir(directory))
+    except OSError:
+        return set()
+
+
+def _new_leftovers(before: Set[str]) -> List[str]:
+    """``before`` 之后新增的、且不属于本模块自己产出的 dst 的文件。"""
+    return sorted((_snapshot() - before) - {dlp._PID_FILE})
+
+
+def test_dlp_leaves_no_work_copy_when_all_channels_fail() -> None:
+    """三条通道全失败时，**密文副本也不能留在临时目录**。
+
+    副本是在目录快照之后创建的，天然不在「差集」里 —— 少了显式 release，
+    每解一个文件就永久留一份（失败路径尤其容易被忽略）。
+    """
+    provider = dlp.get_provider()
+    if provider is None or not provider.available():
+        raise unittest.SkipTest("当前系统没有可用的解密通道")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _write_encrypted(os.path.join(tmp, "enc.png"), _png_bytes())
+        before = _snapshot()
+        assert dlp.resolve(src).state == dlp.STATE_FAILED
+        leftover = _new_leftovers(before)
+        assert leftover == [], f"临时目录残留：{leftover}"
+    dlp.release_all()
+
+
+def test_dlp_leaves_no_work_copy_after_success() -> None:
+    """成功路径同样不能留副本（成功时 dst 之外的产物都要清掉）。"""
+    class _CopyAll(dlp.DecryptProvider):
+        """把密文当明文交出去（够让 verify_plaintext 通过的假通道）。"""
+
+        name = "fake-copy"
+
+        def available(self) -> bool:
+            return True
+
+        def problem(self) -> str:
+            return ""
+
+        def decrypt(self, src, dst, deadline=None) -> None:
+            with open(src, "rb") as handle:
+                blob = handle.read()
+            with open(dst, "wb") as handle:
+                handle.write(blob[3:])  # 剥掉魔数 = "解密"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _write_encrypted(os.path.join(tmp, "enc.png"), _png_bytes())
+        dlp.set_provider(_CopyAll())
+        before = _snapshot()
+        try:
+            result = dlp.resolve(src)
+            assert result.state == dlp.STATE_DECRYPTED, result.message
+            # 只该多出 dst 一个文件（它要留着给后续读取），不能有多余的副本
+            assert _new_leftovers(before) == [os.path.basename(result.read_path)], \
+                f"除 dst 外还有残留：{_new_leftovers(before)}"
+        finally:
+            dlp.reset_provider()
+            dlp.release_all()
+
+
+def test_dlp_trace_is_silent_by_default_and_verbose_when_enabled() -> None:
+    """`WM_DLP_TRACE` 默认完全安静；打开后要把通道尝试写进 stderr。"""
+    import io
+    import contextlib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _write_encrypted(os.path.join(tmp, "enc.png"), _png_bytes())
+        dlp.set_provider(_CopyAlwaysFails())
+        try:
+            saved = os.environ.get(dlp.TRACE_ENV)
+            dlp._trace_on = None
+            os.environ.pop(dlp.TRACE_ENV, None)
+            dlp._trace_on = None
+            quiet = io.StringIO()
+            with contextlib.redirect_stderr(quiet):
+                dlp.resolve(src)
+            assert quiet.getvalue() == "", "默认不该有任何跟踪输出"
+
+            os.environ[dlp.TRACE_ENV] = "1"
+            dlp._trace_on = None
+            loud = io.StringIO()
+            with contextlib.redirect_stderr(loud):
+                dlp.resolve(src)
+            assert "[TRACE][dlp]" in loud.getvalue(), "打开后应输出跟踪行"
+        finally:
+            if saved is None:
+                os.environ.pop(dlp.TRACE_ENV, None)
+            else:
+                os.environ[dlp.TRACE_ENV] = saved
+            dlp._trace_on = None
+            dlp.reset_provider()
+            dlp.release_all()
+
+
+class _CopyAlwaysFails(dlp.DecryptProvider):
+    """永远失败（用于跟踪日志用例）：保证 chain 会把每条通道都试一遍。"""
+
+    name = "fake-fail"
+
+    def available(self) -> bool:
+        return True
+
+    def problem(self) -> str:
+        return ""
+
+    def decrypt(self, src, dst, deadline=None) -> None:
+        raise dlp.DecryptError("假通道：故意失败")

@@ -113,6 +113,43 @@ def _warn(message: str) -> None:
         pass
 
 
+#: 逐通道跟踪开关的环境变量名。打开后，每条通道的「尝试 / 成功 / 失败」与耗时
+#: 都会写 stderr（冻结版进 ``runtime-<pid>.log``），用来回答内网的两个未知：
+#: **到底是哪条通道解的**、**单文件花了多久**。默认关闭 —— 常规使用不该刷屏。
+TRACE_ENV = "WM_DLP_TRACE"
+
+#: ``None`` = 还没读过环境变量；读一次就缓存（进程内开关不该中途变）。
+_trace_on: Optional[bool] = None
+
+
+def _trace(message: str) -> None:
+    """跟踪日志：只有 ``WM_DLP_TRACE=1`` 时才写，否则完全安静。
+
+    为什么不做成日志级别：本模块要能被无头脚本（``tools/probe_dlp_channels.py``）
+    和冻结版同时用，而冻结版的 stderr 已被 ``main`` 接到 runtime.log —— 走 stderr
+    是唯一一条两条路都通的渠道。
+    """
+    global _trace_on
+    if _trace_on is None:
+        flag = (os.environ.get(TRACE_ENV) or "").strip().lower()
+        _trace_on = flag in ("1", "true", "yes", "on")
+    if not _trace_on:
+        return
+    try:
+        print("[TRACE][dlp] " + message, file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _safe_size(path: str) -> int:
+    """文件大小；读不到就是 0（跟踪日志不该因为 stat 失败把主流程带崩）。"""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def magic() -> bytes:
     """当前生效的加密魔数（默认 ``88 7D 1C``，可用环境变量覆盖）。"""
     raw = (os.environ.get("WM_DLP_MAGIC") or "").strip().replace(" ", "").replace("0x", "")
@@ -514,6 +551,9 @@ class CommandProvider(DecryptProvider):
         finally:
             # 解密器产生的**一切**中间产物都清掉，只留 dst（目录快照差集）
             _cleanup_new_files(before, dst)
+            # 副本本身也在差集之外（快照是在它之后拍的）：解密器没动它时，
+            # 每个文件都会在这里永久留一份密文副本，直到进程退出。
+            release(work)
 
 
 #: **所有**外部解密调用的串行锁。
@@ -579,6 +619,8 @@ class TransparentReadProvider(DecryptProvider):
                 raise DecryptError(f"{self.label}读到 0 字节（路径可能含非 ASCII 字符）")
         finally:
             _cleanup_new_files(before, dst)
+            # 同上：快照拍在副本之后，必须显式删，否则每解一个文件留一份副本
+            release(work)
 
 
 class CmdTypeProvider(TransparentReadProvider):
@@ -717,17 +759,26 @@ class ChainProvider(DecryptProvider):
                 notes.append("已用完全部解密时间预算")
                 break
             label = _channel_label(provider)
+            started = time.monotonic()
+            _trace("尝试 %s（剩余预算 %s）" % (
+                label, "无限" if deadline is None
+                else "%.1fs" % max(0.0, deadline - started)))
             try:
                 _call_decrypt(provider, src, dst, deadline)
             except DecryptError as exc:
                 notes.append(f"{label}：{exc}")
+                _trace("  %s 失败（%.2fs）：%s" % (label, time.monotonic() - started, exc))
                 release(dst)
                 continue
             error = verify_plaintext(dst)
             if error is None:
                 self.last_used = provider
+                _trace("  %s **成功**（%.2fs）-> 本文件走这条通道"
+                       % (label, time.monotonic() - started))
                 return
             notes.append(f"{label}：{error}")
+            _trace("  %s 产物不可用（%.2fs）：%s"
+                   % (label, time.monotonic() - started, error))
             release(dst)
         if not notes:
             raise DecryptError(self.problem() or "没有可用的解密通道")
@@ -936,6 +987,9 @@ class LddecProvider(DecryptProvider):
                 raise DecryptError("解密产物为空（0 字节）")
         finally:
             _cleanup_new_files(before, dst)
+            # dec.exe 的语义是就地覆盖，通常会把副本改名吃掉；但它失败/跳过时
+            # 副本还在 —— 显式删一次，避免临时目录里堆密文副本
+            release(work)
 
 
 def _split_command(template: str) -> List[str]:
@@ -1193,10 +1247,15 @@ def resolve(path: str, budget: Optional[float] = None) -> Resolution:
     （可用 ``WM_DLP_BUDGET`` 覆盖，设为 0 表示不限）。
     """
     global _plain_bytes
+    _started = time.monotonic()
+    _trace("resolve 开始：%s（%.1f KB）" % (path, _safe_size(path) / 1024.0))
     if not is_encrypted(path):
+        _trace("  未命中加密魔数 -> 原样使用（%.2fs）" % (time.monotonic() - _started))
         return Resolution(path, path, STATE_PLAIN)
     if probe_readable(path) is None:
         # 疑似加密但读得开：可能是透明解密已生效，也可能只是魔数撞上了
+        _trace("  命中魔数但原路径可读 -> 直接读明文（%.2fs）"
+               % (time.monotonic() - _started))
         return Resolution(path, path, STATE_DIRECT)
     provider = get_provider()
     if provider is None:
@@ -1228,13 +1287,17 @@ def resolve(path: str, budget: Optional[float] = None) -> Resolution:
     try:
         _call_decrypt(provider, path, dst, deadline)
     except DecryptError as exc:
+        _trace("  全部通道失败（%.2fs）：%s" % (time.monotonic() - _started, exc))
         release(dst)
         return Resolution(None, None, STATE_FAILED, str(exc))
     except Exception as exc:  # 解密器实现可能有未预料的行为，不能让它带崩添加流程
+        _trace("  解密异常（%.2fs）：%s: %s"
+               % (time.monotonic() - _started, type(exc).__name__, exc))
         release(dst)
         return Resolution(None, None, STATE_FAILED, f"解密异常：{type(exc).__name__}: {exc}")
     error = verify_plaintext(dst)
     if error:
+        _trace("  产物校验不通过（%.2fs）：%s" % (time.monotonic() - _started, error))
         release(dst)
         return Resolution(None, None, STATE_FAILED, error)
     with _state_lock:
@@ -1244,6 +1307,8 @@ def resolve(path: str, budget: Optional[float] = None) -> Resolution:
             got = 0
         _plain_bytes += got
         _plain_sizes[os.path.abspath(dst)] = got  # 供 plaintext_problem 比对
+    _trace("  resolve 完成：decrypted（%.2fs，明文 %d 字节）"
+           % (time.monotonic() - _started, got))
     return Resolution(path, dst, STATE_DECRYPTED)
 
 
