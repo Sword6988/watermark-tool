@@ -90,6 +90,21 @@ def _read_icc(raw: object) -> Optional[bytes]:
     return None
 
 
+class PasswordRequiredError(ValueError):
+    """PDF 设有**打开口令**（用户口令），读不到任何页面内容。
+
+    故意继承 :class:`ValueError` 而不是 :class:`Exception`：既有的调用方
+    （``ui/app.py`` 的 ``_abort_open``、``ui/batch.py`` 的失败记录）都按
+    ``except Exception`` 兜住，继承 ``ValueError`` 还能让将来「按 ValueError
+    收窄」的写法不漏掉它。
+
+    为什么单独开一个类型：这类文件**能打开**（``fitz.open`` 不报错、``page_count``
+    甚至返回正常页数），要到取页面尺寸 / 栅格化时才炸，pymupdf 给的是
+    ``document closed or encrypted`` —— 用户看到这句只会以为文件坏了，不知道是
+    要输密码。单独的类型让调用方能给出**可行动**的提示。
+    """
+
+
 class Document:
     """一个待处理的文件（图片或 PDF）。
 
@@ -183,8 +198,39 @@ class Document:
                 self._image = normalized_image
         else:
             self._pdf = fitz.open(self.read_path)
+            self._reject_if_password_protected()
             self.page_count = self._pdf.page_count
             self.frame_count = 1
+
+    def _reject_if_password_protected(self) -> None:
+        """带**打开口令**的 PDF 就地抛出 :class:`PasswordRequiredError`。
+
+        必须在**打开时就判**，不能等取像素：这类文件 ``fitz.open`` 不报错、
+        ``page_count`` 也正常，要到 ``page_size()`` / ``page_image()`` 才炸，
+        届时错误已经到了预览 / 导出阶段，用户只会看到「渲染失败」。
+
+        ``needs_pass`` 为真时先试一次空口令：只设了**所有者口令**（限制打印 /
+        编辑但允许直接打开）的 PDF 也可能被标成需要口令，那类文件是能读的，
+        不能误杀。
+        """
+        if self._pdf is None:
+            return
+        try:
+            needs = bool(self._pdf.needs_pass)
+        except Exception:
+            return  # 拿不到这个属性就按「不需要口令」处理，不因此拒绝文件
+        if not needs:
+            return
+        try:
+            if self._pdf.authenticate(""):
+                return
+        except Exception:
+            pass  # 认证本身出错：按「需要口令」处理（下面会抛，且信息可行动）
+        self._pdf.close()
+        self._pdf = None
+        raise PasswordRequiredError(
+            "该 PDF 设有打开口令，需要密码才能读取 —— "
+            "请先用其它工具解除口令保护，再添加此文件")
 
     # -- 元信息 -----------------------------------------------------------
 
@@ -272,6 +318,7 @@ __all__ = [
     "ext_of",
     "kind_of",
     "is_supported",
+    "PasswordRequiredError",
     "Document",
     "unique_path",
     "plan_output",

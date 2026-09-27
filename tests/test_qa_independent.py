@@ -392,16 +392,17 @@ def test_qa_encrypted_pdf_raises_clear_error_no_output():
             raised = True
         assert raised, "加密 PDF 渲染未抛异常（可能静默产出垃圾）"
         assert not os.path.exists(dst), "加密 PDF 渲染留下了输出文件"
-        doc2 = media.Document(enc)
+        # 带口令的 PDF 现在在**构造时**就被拒绝（比"取页图时才炸"更早、更明确：
+        # 否则文件会先进列表，到预览才失败）。既有的"必须抛 + 不留输出"契约不变。
+        raised = False
         try:
-            raised = False
-            try:
-                doc2.page_image(0)
-            except Exception:
-                raised = True
-            assert raised, "加密 PDF 取页图未抛异常"
-        finally:
-            doc2.close()
+            media.Document(enc)
+        except media.PasswordRequiredError as exc:
+            raised = True
+            assert "口令" in str(exc), f"提示要点明是口令问题，实际：{exc}"
+        except Exception:
+            raised = True  # 换个异常类型也算"抛了"，但不算给出可行动提示
+        assert raised, "带口令的 PDF 构造时未被拒绝（会静默进列表，到预览才失败）"
 
 
 def test_qa_zero_page_pdf_raises_clear_error_no_output():

@@ -100,6 +100,14 @@ def render_preview(
     except render.Cancelled:
         # 渲染内部（图层）检查到取消：这就是「这一帧不要了」，不是失败
         return CANCELLED, 0, 0
+    except media.PasswordRequiredError as exc:
+        # 带口令的 PDF：报具体原因，别混进笼统的「预览渲染失败」
+        if on_problem is not None:
+            try:
+                on_problem(str(exc))
+            except Exception:
+                pass
+        return None, 0, 0
     except Exception:
         # 打开 / 渲染失败：不抛，交给调用方决定如何上报（原始 _preview_worker 推
         # 的是一个 error 消息）。page_w / page_h 取不到就记 0。

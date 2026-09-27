@@ -263,3 +263,76 @@ def test_cmdtype_reads_non_ascii_source_path_byte_exact() -> None:
                 assert handle.read() == blob, "内容不是字节保真"
         finally:
             dlp.release(dst)
+
+
+# ---------------------------------------------------------------------------
+# 带口令的 PDF（审计 §四 第 5 项）
+# ---------------------------------------------------------------------------
+
+def _make_pdf(path: str, password: str = "") -> None:
+    """写一个一页的 PDF；给了 ``password`` 就用 AES-256 加打开口令。"""
+    import pymupdf
+
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text((72, 72), "WATERMARK TEST", fontsize=24)
+        if password:
+            doc.save(path, encryption=pymupdf.PDF_ENCRYPT_AES_256,
+                     owner_pw=password, user_pw=password)
+        else:
+            doc.save(path)
+    finally:
+        doc.close()
+
+
+def test_pdf_with_open_password_raises_actionable_error() -> None:
+    """带**打开口令**的 PDF 必须在打开时就给出「需要密码」的可行动提示。
+
+    这类文件 ``fitz.open`` 不报错、``page_count`` 也正常，要到取页面尺寸才炸，
+    pymupdf 给的是 ``document closed or encrypted`` —— 用户只会以为文件坏了。
+    """
+    import tempfile
+
+    from wm import media
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "secret.pdf")
+        _make_pdf(path, password="123456")
+        try:
+            media.Document(path)
+        except media.PasswordRequiredError as exc:
+            message = str(exc)
+            assert "口令" in message, f"提示要点明是口令问题，实际：{message}"
+            assert "密码" in message, f"提示要让用户在别处输密码，实际：{message}"
+        else:
+            raise AssertionError("带口令的 PDF 应当被拒绝，不能静默打开")
+
+
+def test_pdf_password_error_is_a_valueerror() -> None:
+    """``PasswordRequiredError`` 必须是 ``ValueError`` 的子类。
+
+    调用方现在都用 ``except Exception`` 兜住，但继承 ``ValueError`` 能让将来
+    「按 ValueError 收窄」的写法不漏掉它。
+    """
+    from wm import media
+
+    assert issubclass(media.PasswordRequiredError, ValueError)
+
+
+def test_plain_pdf_is_not_mistaken_for_password_protected() -> None:
+    """普通 PDF 必须照常打开 —— 不能有「凡 PDF 都要密码」的误杀。"""
+    import tempfile
+
+    from wm import media
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "plain.pdf")
+        _make_pdf(path)
+        doc = media.Document(path)
+        try:
+            assert doc.page_count == 1, doc.page_count
+            width, height = doc.page_size(0)
+            assert width > 0 and height > 0, (width, height)
+        finally:
+            doc.close()
