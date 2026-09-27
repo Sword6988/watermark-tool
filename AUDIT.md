@@ -405,10 +405,12 @@ opacity / color）**全部完备**，连续渲染不串水印。
   `tests/test_all.py` 放宽两处墙钟断言（3.0→8.0s、1.0→5.0s）消除 flaky。
 - 低优先 P2 建议（`time.sleep` 让出频率、注解/docstring 覆盖率、cache key 收敛到单函数、`from_dict` 加版本号）
   本次未做，仍列于「P2 改进建议」节，属锦上添花，不影响交付。
-  > **2026-09-27 结账**：其中两项已做（提交 `ec72277` / `eb82283`）——
-  > docstring 补到 wm/ 包 335/386 = 86.8%（面向"为什么"，不凑数）；
-  > `from_dict` 加 `SCHEMA_VERSION`（读过新版本数据不再静默）。
-  > `time.sleep` 让出频率与 cache key 收敛仍未做。
+  > **2026-09-27 结账**：四项**全部已做**（回代码核对，不照抄本清单）：
+  > docstring 补到 `wm/` 包 335/386 = 86.8%；`from_dict` 加 `SCHEMA_VERSION`；
+  > `time.sleep` 已改为每 32 页让出一次（`render.py:597-600`）；
+  > cache key 已收敛到 `spec.block_key()` / `spec.render_key()` 两个方法。
+  > 仍在 P2 清单里未做的只剩：`build/_obsolete` 保留策略、`app.py` 拆分、
+  > 注解覆盖率。
 
 ### ✅ 交付后追加：数字框悬停步进器（方案 C）
 
@@ -593,6 +595,9 @@ tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
 - **块数回退循环参数过度**：`layout.py:240-245` 写了 64 次 ×1.35，实测**所有触发回退的组合都 2 次收敛**；另外 `extra` 基准只用 `iw`（两轴不对称），且回退会静默把间距拉大到设定值的约 2.35 倍、UI 无任何提示
 - **`app.py` 拆分**（见 P1-4）、跨模块私有调用 `render.py:113` 直接调 `layout._render_block_bitmap`
 - `time.sleep(0.001)` 实测 1.58ms/次，200 页多花 0.32s（约 10%），可改成每 16 页让出一次
+  → **2026-09-27 已处理**：改为 `index % 32 == 31` 时才让出（`render.py:597-600`），
+  理由写在代码注释里 —— 让出的目的只是让主线程能刷新进度，不需要每页都让；
+  同时保留"Windows 上 `sleep(0)` 只让出微秒级、主线程 UI 会假死"这条踩过的坑
 - **测试基建**：无超时；**SKIP 不计入退出码**（实测屏蔽 tkinterdnd2 → 退出码 0、7 条零断言用例照样"通过"）；42% 的 assert 无失败消息；5 处硬编码秒数断言会 flaky；`__pycache__` 混了 313/314 两套
 - 注解覆盖率 79%、docstring 覆盖率 45.5% → **2026-09-27：`wm/` 包补到 335/386 = 86.8%**
   （补的是隐式契约：dlp 的 deadline/串行锁/副本释放、app 的预览与批处理并发语义；
@@ -600,6 +605,13 @@ tkinter/font.py:130          __del__ -> self._call("font", "delete", self.name)
 - `WatermarkSpec.from_dict` 无版本号：未知字段静默丢弃、缺失字段静默取默认
   → **2026-09-27 已处理**（`SCHEMA_VERSION`）；行为不变，只是给"读了更新的数据"留下痕迹
 - 新增参数时需同步**两个** cache key（`layout.py:111-118` / `:148-154`），漏改 = 静默渲染错 —— 建议把 key 生成收敛到一个函数
+  → **2026-09-27 已处理**（且原行号早已漂移，本条若照着行号找会扑空）：
+  三处缓存**全部**从 `wm/spec.py` 的两个方法派生 —— `layout.py:183` / `:235` 用
+  `spec.block_key()`，`render.py:484` 的 `_spec_cache_key` 就是 `return spec.render_key()`；
+  已无任何手写字段列表。注意是**两个** key 而非一个：``block_key``（块像素）刻意
+  不含 `font_pct` / `margin_pct`（它们决定排布、不决定块本身的像素），合并成一个
+  会让"改一次边距就重渲染所有块"、缓存命中率归零 —— 要收敛的是**重复的字段枚举**，
+  不是把两种粒度并成一个。
 
 ---
 
